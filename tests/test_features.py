@@ -1,9 +1,13 @@
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
 import polars as pl
 
-from icumodelstream.features import aggregate_numeric_table
+from icumodelstream.features import (
+    aggregate_numeric_table,
+    aggregate_numeric_table_windowed,
+)
 from icumodelstream.io import discover_tables
 
 
@@ -152,3 +156,187 @@ def test_aggregate_numeric_table_cohort_left_join_preserves_missing(tmp_path: Pa
     assert row3["vitals_min"] is None
     assert row3["vitals_max"] is None
     assert row3["vitals_n"] == 0
+
+
+# ---------------------------------------------------------------------------
+# aggregate_numeric_table_windowed
+# ---------------------------------------------------------------------------
+
+
+def _write_vitals_with_dttm(
+    path: Path,
+    hospitalization_ids: list[int],
+    recorded_dttms: list[datetime],
+    values: list[float],
+) -> None:
+    df = pl.DataFrame(
+        {
+            "hospitalization_id": hospitalization_ids,
+            "recorded_dttm": recorded_dttms,
+            "value": values,
+        }
+    ).with_columns(pl.col("recorded_dttm").cast(pl.Datetime(time_zone="UTC")))
+    df.write_parquet(path)
+
+
+def test_aggregate_windowed_happy_path(tmp_path: Path) -> None:
+    """Rows within [anchor, anchor + 24h) are aggregated; rows outside are dropped."""
+    anchor = datetime(2024, 1, 1, 0, 0, tzinfo=timezone.utc)
+    _write_vitals_with_dttm(
+        tmp_path / "vitals.parquet",
+        hospitalization_ids=[1, 1, 1, 1],
+        recorded_dttms=[
+            anchor + timedelta(hours=1),   # in
+            anchor + timedelta(hours=12),  # in
+            anchor + timedelta(hours=23),  # in
+            anchor + timedelta(hours=25),  # out
+        ],
+        values=[10.0, 20.0, 30.0, 999.0],
+    )
+
+    tables = discover_tables(tmp_path)
+    anchors = pl.DataFrame(
+        {"hospitalization_id": [1], "anchor_dttm": [anchor]}
+    ).with_columns(pl.col("anchor_dttm").cast(pl.Datetime(time_zone="UTC")))
+
+    result = aggregate_numeric_table_windowed(
+        tables, "vitals", "vitals", anchors=anchors, window_hours=24
+    )
+
+    assert result.height == 1
+    row = result.row(0, named=True)
+    assert row["vitals_n"] == 3
+    assert row["vitals_mean"] == pytest.approx(20.0)
+    assert row["vitals_min"] == pytest.approx(10.0)
+    assert row["vitals_max"] == pytest.approx(30.0)
+
+
+def test_aggregate_windowed_excludes_boundary(tmp_path: Path) -> None:
+    """Row at exactly anchor + window_hours is excluded (half-open interval)."""
+    anchor = datetime(2024, 1, 1, 0, 0, tzinfo=timezone.utc)
+    _write_vitals_with_dttm(
+        tmp_path / "vitals.parquet",
+        hospitalization_ids=[1, 1],
+        recorded_dttms=[
+            anchor + timedelta(hours=0),   # exactly anchor: in
+            anchor + timedelta(hours=24),  # exactly anchor + window: out
+        ],
+        values=[10.0, 99.0],
+    )
+
+    tables = discover_tables(tmp_path)
+    anchors = pl.DataFrame(
+        {"hospitalization_id": [1], "anchor_dttm": [anchor]}
+    ).with_columns(pl.col("anchor_dttm").cast(pl.Datetime(time_zone="UTC")))
+
+    result = aggregate_numeric_table_windowed(
+        tables, "vitals", "vitals", anchors=anchors, window_hours=24
+    )
+
+    assert result.height == 1
+    assert result["vitals_n"][0] == 1
+    assert result["vitals_max"][0] == pytest.approx(10.0)
+
+
+def test_aggregate_windowed_excludes_pre_anchor(tmp_path: Path) -> None:
+    """Row at anchor - 1h is excluded; pre-anchor data must not leak in."""
+    anchor = datetime(2024, 1, 1, 12, 0, tzinfo=timezone.utc)
+    _write_vitals_with_dttm(
+        tmp_path / "vitals.parquet",
+        hospitalization_ids=[1, 1],
+        recorded_dttms=[
+            anchor - timedelta(hours=1),  # before anchor: out
+            anchor + timedelta(hours=2),  # in
+        ],
+        values=[99.0, 42.0],
+    )
+
+    tables = discover_tables(tmp_path)
+    anchors = pl.DataFrame(
+        {"hospitalization_id": [1], "anchor_dttm": [anchor]}
+    ).with_columns(pl.col("anchor_dttm").cast(pl.Datetime(time_zone="UTC")))
+
+    result = aggregate_numeric_table_windowed(
+        tables, "vitals", "vitals", anchors=anchors, window_hours=24
+    )
+
+    assert result.height == 1
+    assert result["vitals_n"][0] == 1
+    assert result["vitals_mean"][0] == pytest.approx(42.0)
+
+
+def test_aggregate_windowed_cohort_left_join_preserves_empty(tmp_path: Path) -> None:
+    """Cohort hospitalizations with zero in-window rows get _n=0 and null stats."""
+    anchor = datetime(2024, 1, 1, 0, 0, tzinfo=timezone.utc)
+    _write_vitals_with_dttm(
+        tmp_path / "vitals.parquet",
+        hospitalization_ids=[1, 2, 3],
+        recorded_dttms=[
+            anchor + timedelta(hours=1),   # h1: in-window
+            anchor + timedelta(hours=99),  # h2: out-of-window
+            anchor + timedelta(hours=2),   # h3: in-window but not in cohort
+        ],
+        values=[10.0, 20.0, 30.0],
+    )
+
+    tables = discover_tables(tmp_path)
+    # Cohort has h1, h2 only. h2 has 0 in-window rows -> _n=0 in result.
+    cohort = pl.DataFrame({"hospitalization_id": [1, 2]})
+    anchors = pl.DataFrame(
+        {"hospitalization_id": [1, 2], "anchor_dttm": [anchor, anchor]}
+    ).with_columns(pl.col("anchor_dttm").cast(pl.Datetime(time_zone="UTC")))
+
+    result = aggregate_numeric_table_windowed(
+        tables, "vitals", "vitals", anchors=anchors, window_hours=24, cohort=cohort
+    )
+
+    assert result.height == 2
+    assert result["hospitalization_id"].to_list() == [1, 2]
+    row1 = result.filter(pl.col("hospitalization_id") == 1).row(0, named=True)
+    row2 = result.filter(pl.col("hospitalization_id") == 2).row(0, named=True)
+    assert row1["vitals_n"] == 1
+    assert row1["vitals_mean"] == pytest.approx(10.0)
+    assert row2["vitals_n"] == 0
+    assert row2["vitals_mean"] is None
+    assert row2["vitals_min"] is None
+    assert row2["vitals_max"] is None
+
+
+def test_aggregate_windowed_raises_on_tz_mismatch(tmp_path: Path) -> None:
+    """Tz-naive anchors vs tz-aware source datetimes -> ValueError mentioning tz/dtype."""
+    anchor = datetime(2024, 1, 1, 0, 0, tzinfo=timezone.utc)
+    _write_vitals_with_dttm(
+        tmp_path / "vitals.parquet",
+        hospitalization_ids=[1],
+        recorded_dttms=[anchor + timedelta(hours=1)],
+        values=[10.0],
+    )
+
+    tables = discover_tables(tmp_path)
+    # Naive anchor (no tz_aware cast) -> mismatch.
+    naive_anchor = datetime(2024, 1, 1, 0, 0)
+    anchors = pl.DataFrame(
+        {"hospitalization_id": [1], "anchor_dttm": [naive_anchor]}
+    )
+
+    with pytest.raises(ValueError, match="(?i)timezone|tz|dtype"):
+        aggregate_numeric_table_windowed(
+            tables, "vitals", "vitals", anchors=anchors, window_hours=24
+        )
+
+
+def test_aggregate_windowed_raises_on_missing_dttm_col(tmp_path: Path) -> None:
+    """Source with no recognized *_dttm column -> ValueError."""
+    pl.DataFrame(
+        {"hospitalization_id": [1], "value": [10.0]}
+    ).write_parquet(tmp_path / "vitals.parquet")
+
+    tables = discover_tables(tmp_path)
+    anchors = pl.DataFrame(
+        {"hospitalization_id": [1], "anchor_dttm": [datetime(2024, 1, 1, tzinfo=timezone.utc)]}
+    ).with_columns(pl.col("anchor_dttm").cast(pl.Datetime(time_zone="UTC")))
+
+    with pytest.raises(ValueError, match="(?i)datetime|dttm"):
+        aggregate_numeric_table_windowed(
+            tables, "vitals", "vitals", anchors=anchors, window_hours=24
+        )
