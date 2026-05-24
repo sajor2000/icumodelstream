@@ -79,4 +79,8 @@ def aggregate_numeric_table(
                 f"Cast IDs to a common type before calling aggregate_numeric_table."
             )
         out = cohort.select("hospitalization_id").join(out, on="hospitalization_id", how="left")
+        # Hospitalizations with zero measurements get null _n from the left join.
+        # Coerce to 0 so callers can distinguish "no data" (n=0) from "couldn't compute".
+        # mean/min/max stay null -- they're undefined without data.
+        out = out.with_columns(pl.col(f"{prefix}_n").fill_null(0))
     return out.sort("hospitalization_id")

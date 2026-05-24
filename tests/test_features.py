@@ -130,8 +130,12 @@ def test_aggregate_numeric_table_raises_on_id_dtype_mismatch(tmp_path: Path) -> 
 
 
 def test_aggregate_numeric_table_cohort_left_join_preserves_missing(tmp_path: Path) -> None:
-    """Cohort hospitalizations with no rows in the source table should be preserved with
-    null aggregates — left join semantics, not inner join."""
+    """Cohort hospitalizations with no rows in the source table should be preserved.
+
+    Distinguish "no data" (n=0) from "couldn't compute" (mean/min/max=null):
+    - _n is coerced to 0 so downstream filters like `n >= 50` work correctly
+    - mean/min/max stay null because they're genuinely undefined without data
+    """
     pl.DataFrame(
         {"hospitalization_id": [1, 2], "value": [10.0, 20.0]}
     ).write_parquet(tmp_path / "vitals.parquet")
@@ -147,4 +151,4 @@ def test_aggregate_numeric_table_cohort_left_join_preserves_missing(tmp_path: Pa
     assert row3["vitals_mean"] is None
     assert row3["vitals_min"] is None
     assert row3["vitals_max"] is None
-    assert row3["vitals_n"] is None
+    assert row3["vitals_n"] == 0
