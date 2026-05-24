@@ -83,6 +83,10 @@ def _(config, mo, pl, waterfall):
 
 @app.cell
 def _(cohort, mo):
+    # PHI note: this preview renders only in the live marimo session — .py notebooks
+    # store no outputs. Do NOT run `marimo export html/ipynb` on this notebook against
+    # real CLIF-MIMIC data; the resulting file would embed patient_id + hospitalization_id +
+    # age and is gitignored only at notebooks/*.{html,ipynb}. See CLAUDE.md > Data safety rules.
     mo.vstack([
         mo.md(f"**Final cohort: {cohort.height:,} hospitalizations**"),
         cohort.head(20),

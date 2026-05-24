@@ -96,6 +96,8 @@ Use Python 3.11+, type hints, `pathlib.Path`, and `polars` lazy scans where poss
 
 Treat all real ICU data as sensitive. MIMIC data are credentialed and must follow PhysioNet rules. Rush/local hospital CLIF data may contain PHI and must remain in approved institutional environments. Never push data, credentials, `.env` files, patient-level screenshots, or row-level outputs.
 
+**Marimo notebook export trap.** Marimo `.py` notebooks are safe to commit because they store no cell outputs — the patient-level previews you see in the editor live only in your browser. But `marimo export html notebooks/03_cohort.py` (or `ipynb`, or screenshots, or `marimo export public`) bakes those previews into a file that *can* be committed or shared. The repo's `.gitignore` blocks `notebooks/*.html`, `notebooks/*.ipynb`, `notebooks/__marimo__/`, and common figure formats — do not weaken those entries, do not move exports under another directory, and do not paste cell screenshots into PRs or Slack. Every notebook cell that calls `.head()` against real data is a candidate PHI payload the moment it is rendered to a static file.
+
 ## Suggested Claude Code build order
 
 1. Run `pytest` and confirm the skeleton is green.

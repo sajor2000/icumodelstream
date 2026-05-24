@@ -8,10 +8,15 @@ __pycache__/
 .coverage
 htmlcov/
 
-# Notebook exports (never commit rendered output)
+# Notebook exports (never commit rendered output — see CLAUDE.md > Data safety rules)
+# .py notebooks store no outputs, but any export format below CAN embed patient-level rows.
 notebooks/*.html
 notebooks/*.ipynb
+notebooks/*.json
 notebooks/__marimo__/
+notebooks/_marimo_assets/
+notebooks/public/
+notebooks/*-export/
 notebooks/*.png
 notebooks/*.svg
 notebooks/*.pdf

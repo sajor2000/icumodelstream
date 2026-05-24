@@ -98,6 +98,10 @@ def _(labs_features, mo, vitals_features):
 
 @app.cell
 def _(features, mo):
+    # PHI note: this preview renders only in the live marimo session — .py notebooks
+    # store no outputs. Do NOT run `marimo export html/ipynb` on this notebook against
+    # real CLIF-MIMIC data; the resulting file would embed hospitalization_id and per-stay
+    # aggregates. See CLAUDE.md > Data safety rules for the gitignore contract.
     mo.vstack([
         mo.md(f"**Feature matrix: {features.height:,} rows × {features.width} columns**"),
         features.head(20),
