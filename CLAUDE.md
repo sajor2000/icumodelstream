@@ -6,22 +6,68 @@ This file is the working agreement for Claude Code when building **ICU Model Str
 
 Build a local-first pipeline that reads CLIF-MIMIC parquet tables, validates expected CLIF structure, produces QC reports, creates a reproducible adult ICU cohort, and prepares baseline features. Do not jump to foundation-model training until the data pipeline, tests, and baseline outputs are correct.
 
-## Karpathy-inspired engineering rules
+## Karpathy-style operating rules
 
-The project should follow a practical, small-surface-area style often associated with strong research engineering: make the code obvious, keep state explicit, test the small pieces, and avoid clever abstractions until the simple version works.
+These rules adapt the practical engineering guidance from `multica-ai/andrej-karpathy-skills` to this ICU data project. The bias is toward caution over speed because a small data mistake in ICU modeling can invalidate the whole analysis.
 
-1. **Keep it simple.** Prefer one readable file with clear functions over a premature framework. If a function needs a long explanation, rewrite it.
-2. **Make every step runnable.** Each major pipeline step should have a CLI command and a small test.
-3. **Start with tiny data.** Use hand-built toy tables in tests before touching real CLIF-MIMIC parquet.
-4. **Inspect shapes constantly.** Print or log row counts, column counts, key IDs, and time ranges after every major transformation.
-5. **Fail loudly on data assumptions.** If a required column is missing, raise a clear error that names the table and candidate fix.
-6. **Prefer deterministic outputs.** Sort by stable identifiers before writing cohorts or features. Avoid randomness unless a seed is explicit.
-7. **Do not hide complexity.** If CLIF tables vary by version, write explicit adapters and document them.
-8. **No silent patient leakage.** For prediction tasks, separate train/test by patient or hospitalization before feature generation whenever possible.
-9. **Baselines before deep learning.** Build TableOne/QC and LightGBM-style baselines before neural models.
-10. **One change at a time.** Make small commits with tests. Do not refactor and change behavior in the same commit.
-11. **No data in git.** Never commit parquet, CSV extracts, credentials, PHI, or generated model checkpoints.
-12. **When uncertain, write a failing test first.** Capture the expected behavior, then implement the smallest fix.
+### 1. Think before coding
+
+Do not assume, do not hide uncertainty, and do not silently choose between ambiguous interpretations. Before implementing a nontrivial change, state the assumption, the intended files to touch, and the verification step. If the request could mean multiple things, ask or present the tradeoff before editing.
+
+For this project, common ambiguity includes CLIF table version, column naming, whether an output is patient-level or aggregate-only, whether MIMIC-derived data may be written to disk, and whether a task belongs in local Mac validation or rented-GPU training.
+
+### 2. Simplicity first
+
+Write the minimum code that solves the current phase. Do not add speculative abstractions, plugin systems, background services, model-training frameworks, or broad configurability until a real use case forces them. If a function grows large or confusing, rewrite it into a smaller readable version.
+
+The first implementation should remain boring: discover parquet files, inspect schemas, validate required columns, create QC reports, define cohorts, and create baseline features. Deep learning comes later.
+
+### 3. Surgical changes only
+
+Touch only the files required by the user request. Match the existing style. Do not refactor adjacent code, rename modules, reformat unrelated files, or delete unrelated dead code. If unrelated problems are found, mention them separately rather than fixing them opportunistically.
+
+Every changed line should have a direct reason. If the change creates unused imports, variables, functions, or tests, clean up only the orphaned code created by that change.
+
+### 4. Goal-driven execution
+
+Turn every task into verifiable success criteria. A good implementation plan should read like this: change one thing, run a check, inspect the output, then continue. Weak goals such as “make it work” are not acceptable for this repository.
+
+Examples:
+
+| Request | Better success criterion |
+|---|---|
+| Add schema validation | Add a toy parquet test where a required column is missing, then ensure the CLI reports the missing table/column clearly. |
+| Build cohort logic | Add a fixture with adult, pediatric, ICU, and non-ICU rows, then confirm only eligible ICU hospitalizations are returned. |
+| Add baseline features | Add a tiny vitals/labs fixture and verify deterministic per-hospitalization aggregates. |
+| Prepare GPU training | Add a synthetic-data dry run and keep it separate from CLIF-MIMIC data paths. |
+
+### 5. Start with tiny data
+
+Use hand-built toy parquet tables in `tests/` before touching real CLIF-MIMIC parquet. The real parquet files should be used only for local inspection and never committed. Tests should be deterministic, fast, and readable by a clinician-engineer reviewing the project.
+
+### 6. Inspect shapes constantly
+
+After every major data transformation, log or print row counts, column counts, key identifiers, and time ranges. Prefer explicit checks over implicit assumptions. If the number of rows changes, the code should make it obvious whether that change was expected.
+
+### 7. Fail loudly on data assumptions
+
+If a required table or column is missing, raise a clear error that names the table, names the required column, shows nearby available columns when possible, and suggests the next inspection command. Do not silently produce partial cohorts or empty features.
+
+### 8. No silent patient leakage
+
+For prediction tasks, separate train/test by patient or hospitalization before feature generation whenever possible. Do not allow future information to enter baseline features. Any label window, observation window, or censoring rule must be explicit in code and docs.
+
+### 9. Baselines before deep learning
+
+Build QC, cohort definitions, descriptive tables, and LightGBM-style baselines before neural models. Do not add foundation-model training, CUDA code, or rented-GPU scripts until the local data pipeline and baseline outputs are reproducible.
+
+### 10. One change at a time
+
+Make small commits with tests. Do not mix behavior changes with broad refactors. When uncertain, write a failing test first, then implement the smallest fix that makes the test pass.
+
+### 11. No data in git
+
+Never commit parquet, CSV extracts, credentials, PHI, generated patient-level reports, model checkpoints trained on restricted data, or screenshots containing patient-level rows. The `.gitignore` file helps, but every commit still needs human review.
 
 ## Local machine boundaries
 
