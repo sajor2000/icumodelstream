@@ -3,6 +3,9 @@ VENV = .venv
 .PHONY: install test lint format inspect qc cohort notebook
 
 notebook:
+ifndef NOTEBOOK
+	$(error NOTEBOOK is not set. Usage: make notebook NOTEBOOK=notebooks/01_inspect.py)
+endif
 	$(VENV)/bin/marimo edit $(NOTEBOOK)
 
 install:
