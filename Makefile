@@ -1,15 +1,19 @@
 VENV = .venv
+PY = $(VENV)/bin/python
 
 .PHONY: install test lint format inspect qc cohort notebook
 
-notebook:
-ifndef NOTEBOOK
+$(VENV):
+	python3.11 -m venv $(VENV)
+
+notebook: $(VENV)
+ifeq ($(strip $(NOTEBOOK)),)
 	$(error NOTEBOOK is not set. Usage: make notebook NOTEBOOK=notebooks/01_inspect.py)
 endif
-	$(VENV)/bin/marimo edit $(NOTEBOOK)
+	$(PY) -m marimo edit $(NOTEBOOK)
 
-install:
-	python3.11 -m pip install -e '.[dev,ml]'
+install: $(VENV)
+	$(PY) -m pip install -e '.[dev,ml]'
 
 test:
 	pytest -q

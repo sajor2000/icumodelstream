@@ -8,6 +8,14 @@ __pycache__/
 .coverage
 htmlcov/
 
+# Notebook exports (never commit rendered output)
+notebooks/*.html
+notebooks/*.ipynb
+notebooks/__marimo__/
+notebooks/*.png
+notebooks/*.svg
+notebooks/*.pdf
+
 # Environments
 .venv/
 .env
@@ -17,11 +25,19 @@ htmlcov/
 # Local machine-specific configs (never commit)
 configs/local.yaml
 
+# Data provenance with real extract details (example template stays trackable)
+/data/provenance.yaml
+
 # Data: never commit CLIF/MIMIC parquet or PHI
 /data/raw/
 /data/interim/
 /data/processed/
 /data/external/
+# Allow-list semantics for /data/: ignore everything except README.md and provenance example.
+/data/*
+!/data/README.md
+!/data/provenance.yaml.example
+# Per-format globs are defense-in-depth for anywhere in the repo.
 *.parquet
 *.duckdb
 *.db

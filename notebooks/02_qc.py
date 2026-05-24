@@ -24,8 +24,22 @@ def _(mo):
 def _(mo):
     from pathlib import Path
     from icumodelstream.config import load_config
-    config = load_config(Path(__file__).parent.parent / "configs" / "local.yaml")
+    configs_dir = Path(__file__).parent.parent / "configs"
+    config_path = configs_dir / "local.yaml"
+    example_path = configs_dir / "local.example.yaml"
+    if config_path.exists():
+        config = load_config(config_path)
+        config_notice = None
+    elif example_path.exists():
+        config = load_config(example_path)
+        config_notice = mo.md(
+            f"ℹ️ `configs/local.yaml` not found — using `{example_path.name}`. "
+            "Copy it to `local.yaml` and edit `data.root` for your machine."
+        )
+    else:
+        mo.stop(True, mo.md(f"❌ No config file in `{configs_dir}`. Copy `local.example.yaml` to `local.yaml`."))
     mo.stop(config.safety.allow_phi, mo.md("**Safety check failed:** `allow_phi` must be False"))
+    config_notice
     return (config,)
 
 
@@ -36,6 +50,8 @@ def _(config, mo):
         tables = discover_tables(config.data.root, config.data.table_glob)
     except FileNotFoundError as e:
         mo.stop(True, mo.md(f"⚠️ Data root not found: `{config.data.root}`\n\n{e}"))
+    except ValueError as e:
+        mo.stop(True, mo.md(f"⚠️ Duplicate table names in data root:\n\n{e}"))
     return (tables,)
 
 
@@ -53,19 +69,27 @@ def _(mo, report):
     for tbl in report["tables"]:
         n_rows = tbl["n_rows"]
         miss = tbl["missing_first_columns"]
-        if n_rows > 0 and miss:
+        n_checked = len(miss)
+        n_total = tbl["n_columns"]
+        header = f"## {tbl['table']} — {n_rows:,} rows × {n_total} columns"
+        if n_checked < n_total:
+            header += f" (QC inspected first {n_checked})"
+        nonzero = {k: v for k, v in miss.items() if v > 0} if n_rows > 0 else {}
+        if nonzero:
             miss_df = pl.DataFrame({
-                "column": list(miss.keys()),
-                "n_null": list(miss.values()),
-                "n_rows": [n_rows] * len(miss),
-                "pct_null": [round(v / n_rows * 100, 1) for v in miss.values()],
+                "column": list(nonzero.keys()),
+                "n_null": list(nonzero.values()),
+                "n_rows": [n_rows] * len(nonzero),
+                "pct_null": [round(v / n_rows * 100, 1) for v in nonzero.values()],
             })
+            body = miss_df
         else:
-            miss_df = pl.DataFrame({"column": [], "n_null": [], "n_rows": [], "pct_null": []})
-        sections.append(mo.vstack([
-            mo.md(f"## {tbl['table']} — {n_rows:,} rows × {tbl['n_columns']} columns"),
-            miss_df,
-        ]))
+            body = mo.md(
+                "_No null values in inspected columns._"
+                if n_rows > 0
+                else "_Empty table — 0 rows._"
+            )
+        sections.append(mo.vstack([mo.md(header), body]))
     mo.vstack(sections)
     return
 

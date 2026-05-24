@@ -14,19 +14,23 @@ class TableRef:
     path: Path
 
 
+CLIF_PREFIXES = ("clif_", "clif2_", "mimic_clif_", "rush_clif_")
+
+
 def table_name_from_path(path: Path) -> str:
     """Infer a CLIF table name from a parquet path.
 
-    Strips the file extension and any leading ``clif_`` prefix so that
-    files named ``clif_patient.parquet`` are registered as ``patient``.
+    Strips the file extension and any known CLIF prefix (``clif_``, ``clif2_``,
+    ``mimic_clif_``, ``rush_clif_``) so files like ``clif2_patient.parquet`` or
+    ``mimic_clif_hospitalization.parquet`` are registered under their bare table name.
     """
     name = path.name
     for suffix in (".parquet", ".parq"):
-        if name.endswith(suffix):
-            name = name[: -len(suffix)]
+        name = name.removesuffix(suffix)
     name = name.lower()
-    if name.startswith("clif_"):
-        name = name[len("clif_"):]  # "clif_patient" -> "patient"
+    for prefix in CLIF_PREFIXES:
+        if name.startswith(prefix):
+            return name.removeprefix(prefix)
     return name
 
 

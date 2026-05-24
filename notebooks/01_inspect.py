@@ -24,8 +24,22 @@ def _(mo):
 def _(mo):
     from pathlib import Path
     from icumodelstream.config import load_config
-    config = load_config(Path(__file__).parent.parent / "configs" / "local.yaml")
+    configs_dir = Path(__file__).parent.parent / "configs"
+    config_path = configs_dir / "local.yaml"
+    example_path = configs_dir / "local.example.yaml"
+    if config_path.exists():
+        config = load_config(config_path)
+        config_notice = None
+    elif example_path.exists():
+        config = load_config(example_path)
+        config_notice = mo.md(
+            f"ℹ️ `configs/local.yaml` not found — using `{example_path.name}`. "
+            "Copy it to `local.yaml` and edit `data.root` for your machine."
+        )
+    else:
+        mo.stop(True, mo.md(f"❌ No config file in `{configs_dir}`. Copy `local.example.yaml` to `local.yaml`."))
     mo.stop(config.safety.allow_phi, mo.md("**Safety check failed:** `allow_phi` must be False"))
+    config_notice
     return (config,)
 
 
@@ -36,6 +50,8 @@ def _(config, mo):
         tables = discover_tables(config.data.root, config.data.table_glob)
     except FileNotFoundError as e:
         mo.stop(True, mo.md(f"⚠️ Data root not found: `{config.data.root}`\n\n{e}"))
+    except ValueError as e:
+        mo.stop(True, mo.md(f"⚠️ Duplicate table names in data root:\n\n{e}"))
     return (tables,)
 
 

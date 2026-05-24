@@ -1,0 +1,15 @@
+# Data provenance — copy to data/provenance.yaml (gitignored) and fill in for each data extract.
+# Required by CLAUDE.md data safety rules. Do not commit data/provenance.yaml.
+
+clif_spec_version: "2.1"        # e.g., 2.0, 2.1
+mimic_version: ""               # e.g., "mimic-iv-2.2"
+physionet_snapshot_date: ""     # YYYY-MM-DD when data was downloaded
+extract_date: ""                # YYYY-MM-DD when this local extract was created
+extract_location: ""            # absolute path on the local machine
+
+tables:
+  # one entry per parquet file in data.root
+  # - name: clif_patient
+  #   path: clif_patient.parquet
+  #   sha256: ""                  # `shasum -a 256 <file>`
+  #   row_count: 0

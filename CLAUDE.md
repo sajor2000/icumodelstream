@@ -83,6 +83,7 @@ Use the Mac for CLIF parquet inspection, schema validation, QC, cohort construct
 | `src/icumodelstream/cohorts.py` | Reproducible cohort definitions. |
 | `src/icumodelstream/features.py` | Baseline feature tables. |
 | `src/icumodelstream/cli.py` | Terminal entry points. |
+| `notebooks/` | Marimo notebooks that demonstrate the pipeline against local CLIF parquet. No core logic. |
 | `tests/` | Toy-data unit tests. No real patient data. |
 | `configs/` | Local configs. Keep private configs untracked. |
 | `docs/` | Roadmap and design notes. |

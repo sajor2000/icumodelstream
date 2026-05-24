@@ -24,8 +24,22 @@ def _(mo):
 def _(mo):
     from pathlib import Path
     from icumodelstream.config import load_config
-    config = load_config(Path(__file__).parent.parent / "configs" / "local.yaml")
+    configs_dir = Path(__file__).parent.parent / "configs"
+    config_path = configs_dir / "local.yaml"
+    example_path = configs_dir / "local.example.yaml"
+    if config_path.exists():
+        config = load_config(config_path)
+        config_notice = None
+    elif example_path.exists():
+        config = load_config(example_path)
+        config_notice = mo.md(
+            f"ℹ️ `configs/local.yaml` not found — using `{example_path.name}`. "
+            "Copy it to `local.yaml` and edit `data.root` for your machine."
+        )
+    else:
+        mo.stop(True, mo.md(f"❌ No config file in `{configs_dir}`. Copy `local.example.yaml` to `local.yaml`."))
     mo.stop(config.safety.allow_phi, mo.md("**Safety check failed:** `allow_phi` must be False"))
+    config_notice
     return (config,)
 
 
@@ -36,19 +50,24 @@ def _(config, mo):
         tables = discover_tables(config.data.root, config.data.table_glob)
     except FileNotFoundError as e:
         mo.stop(True, mo.md(f"⚠️ Data root not found: `{config.data.root}`\n\n{e}"))
+    except ValueError as e:
+        mo.stop(True, mo.md(f"⚠️ Duplicate table names in data root:\n\n{e}"))
     return (tables,)
 
 
 @app.cell
-def _(config, tables):
+def _(config, mo, tables):
     from icumodelstream.cohorts import CohortSpec, build_adult_icu_cohort
-    cohort = build_adult_icu_cohort(
-        tables,
-        CohortSpec(
-            min_age=config.cohort.min_age,
-            require_icu_location=config.cohort.require_icu_location,
-        ),
-    )
+    try:
+        cohort = build_adult_icu_cohort(
+            tables,
+            CohortSpec(
+                min_age=config.cohort.min_age,
+                require_icu_location=config.cohort.require_icu_location,
+            ),
+        )
+    except KeyError as e:
+        mo.stop(True, mo.md(f"❌ Required CLIF table missing while building cohort: {e}"))
     return (cohort,)
 
 
@@ -59,11 +78,11 @@ def _(cohort, mo, tables):
     if "vitals" in tables:
         try:
             vitals_features = _aggregate_numeric_table(tables, "vitals", "vitals", cohort=cohort)
-        except ValueError as e:
-            vitals_warn = str(e)
+        except Exception as e:
+            vitals_warn = f"{type(e).__name__}: {e}"
     else:
         vitals_warn = "vitals table not found in data root"
-    _ = mo.md(f"⚠️ Vitals: {vitals_warn}") if vitals_warn else None
+    mo.md(f"⚠️ Vitals: {vitals_warn}") if vitals_warn else mo.md("✅ Vitals features computed.")
     return (vitals_features, vitals_warn)
 
 
@@ -74,11 +93,11 @@ def _(cohort, mo, tables):
     if "labs" in tables:
         try:
             labs_features = _aggregate_numeric_table(tables, "labs", "labs", cohort=cohort)
-        except ValueError as e:
-            labs_warn = str(e)
+        except Exception as e:
+            labs_warn = f"{type(e).__name__}: {e}"
     else:
         labs_warn = "labs table not found in data root"
-    _ = mo.md(f"⚠️ Labs: {labs_warn}") if labs_warn else None
+    mo.md(f"⚠️ Labs: {labs_warn}") if labs_warn else mo.md("✅ Labs features computed.")
     return (labs_features, labs_warn)
 
 

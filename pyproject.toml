@@ -24,7 +24,7 @@ dev = [
     "pytest>=8",
     "ruff>=0.5",
     "mypy>=1.10",
-    "marimo>=0.19",
+    "marimo>=0.23.8,<0.24",
 ]
 ml = [
     "numpy>=1.26",
