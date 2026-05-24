@@ -14,6 +14,9 @@ htmlcov/
 .env.*
 !.env.example
 
+# Local machine-specific configs (never commit)
+configs/local.yaml
+
 # Data: never commit CLIF/MIMIC parquet or PHI
 /data/raw/
 /data/interim/

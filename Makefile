@@ -1,4 +1,9 @@
-.PHONY: install test lint format inspect qc cohort
+VENV = .venv
+
+.PHONY: install test lint format inspect qc cohort notebook
+
+notebook:
+	$(VENV)/bin/marimo edit $(NOTEBOOK)
 
 install:
 	python3.11 -m pip install -e '.[dev,ml]'
