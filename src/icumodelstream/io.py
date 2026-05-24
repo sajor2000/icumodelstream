@@ -15,12 +15,19 @@ class TableRef:
 
 
 def table_name_from_path(path: Path) -> str:
-    """Infer a CLIF table name from a parquet path."""
+    """Infer a CLIF table name from a parquet path.
+
+    Strips the file extension and any leading ``clif_`` prefix so that
+    files named ``clif_patient.parquet`` are registered as ``patient``.
+    """
     name = path.name
     for suffix in (".parquet", ".parq"):
         if name.endswith(suffix):
             name = name[: -len(suffix)]
-    return name.lower()
+    name = name.lower()
+    if name.startswith("clif_"):
+        name = name[len("clif_"):]  # "clif_patient" → "patient"
+    return name
 
 
 def discover_tables(data_root: str | Path, table_glob: str = "*.parquet") -> dict[str, TableRef]:
