@@ -4,7 +4,14 @@ import polars as pl
 
 from icumodelstream.io import TableRef, scan_table
 
-VALUE_CANDIDATES = ("value", "numeric_value", "measurement_value", "lab_value")
+VALUE_CANDIDATES = (
+    "value",
+    "numeric_value",
+    "measurement_value",
+    "lab_value",
+    "vital_value",        # CLIF 2.1 vitals table
+    "lab_value_numeric",  # CLIF 2.1 labs table
+)
 NAME_CANDIDATES = ("name", "variable", "lab_name", "vital_name", "category")
 
 
