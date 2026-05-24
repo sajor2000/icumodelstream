@@ -26,7 +26,7 @@ def table_name_from_path(path: Path) -> str:
             name = name[: -len(suffix)]
     name = name.lower()
     if name.startswith("clif_"):
-        name = name[len("clif_"):]  # "clif_patient" → "patient"
+        name = name[len("clif_"):]  # "clif_patient" -> "patient"
     return name
 
 
@@ -36,10 +36,14 @@ def discover_tables(data_root: str | Path, table_glob: str = "*.parquet") -> dic
     if not root.exists():
         raise FileNotFoundError(f"CLIF data root does not exist: {root}")
     paths = sorted(root.glob(table_glob))
-    tables = {
-        table_name_from_path(path): TableRef(name=table_name_from_path(path), path=path)
-        for path in paths
-    }
+    tables: dict[str, TableRef] = {}
+    for path in paths:
+        key = table_name_from_path(path)
+        if key in tables:
+            raise ValueError(
+                f"Duplicate table name {key!r}: both {tables[key].path} and {path} resolve to the same key."
+            )
+        tables[key] = TableRef(name=key, path=path)
     if not tables:
         raise FileNotFoundError(f"No parquet tables found in {root} with glob {table_glob!r}")
     return tables
