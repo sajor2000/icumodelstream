@@ -57,66 +57,44 @@ def _(config, mo):
 
 
 @app.cell
-def _(config, mo, pl, tables):
-    from icumodelstream.io import scan_table
-    from icumodelstream.cohorts import AGE_CANDIDATES, first_existing_column
-
-    try:
-        hosp_lf = scan_table(tables, "hospitalization")
-        patient_lf = scan_table(tables, "patient")
-    except KeyError as e:
-        mo.stop(True, mo.md(f"❌ Required CLIF table missing: {e}"))
-
-    total_hosp = hosp_lf.select(pl.col("hospitalization_id").n_unique()).collect().item()
-
-    patient_cols = set(patient_lf.collect_schema().names())
-    hosp_cols = set(hosp_lf.collect_schema().names())
-    age_col = first_existing_column(patient_cols | hosp_cols, AGE_CANDIDATES)
-
-    if age_col is not None:
-        after_age = (
-            hosp_lf.join(patient_lf, on="patient_id", how="left")
-            .filter(pl.col(age_col) >= config.cohort.min_age)
-            .select(pl.col("hospitalization_id").n_unique())
-            .collect()
-            .item()
-        )
-    else:
-        after_age = total_hosp
-
-    return (after_age, age_col, total_hosp)
-
-
-@app.cell
-def _(config, tables):
-    from icumodelstream.cohorts import CohortSpec, build_adult_icu_cohort
+def _(config, mo, tables):
+    from icumodelstream.cohorts import CohortSpec, build_cohort_with_waterfall
     spec = CohortSpec(
         min_age=config.cohort.min_age,
         require_icu_location=config.cohort.require_icu_location,
     )
-    cohort = build_adult_icu_cohort(tables, spec)
-    return (cohort, spec)
+    try:
+        cohort, waterfall = build_cohort_with_waterfall(tables, spec)
+    except KeyError as e:
+        mo.stop(True, mo.md(f"❌ Required CLIF table missing: {e}"))
+    return (cohort, spec, waterfall)
 
 
 @app.cell
-def _(after_age, age_col, cohort, config, mo, pl, total_hosp):
+def _(config, mo, pl, waterfall):
     age_step = (
         f"After age ≥ {config.cohort.min_age}"
-        if age_col is not None
+        if waterfall.age_col_used is not None
         else "Age filter SKIPPED — no age column found"
     )
-    icu_step = (
-        "After ICU location filter"
-        if config.cohort.require_icu_location
-        else "ICU filter disabled in config"
-    )
-    waterfall = pl.DataFrame({
-        "step": ["All hospitalizations", age_step, icu_step],
-        "n": [total_hosp, after_age, cohort.height],
+    if waterfall.icu_filter_applied:
+        icu_step = f"After ICU location filter ({waterfall.icu_location_col_used})"
+    elif not config.cohort.require_icu_location:
+        icu_step = "ICU filter disabled in config"
+    else:
+        icu_step = "ICU filter SKIPPED — no ADT or location column found"
+    waterfall_df = pl.DataFrame({
+        "step": ["All hospitalizations", age_step, icu_step, "Final cohort"],
+        "n": [
+            waterfall.total_hospitalizations,
+            waterfall.after_age_filter,
+            waterfall.after_icu_filter,
+            waterfall.final,
+        ],
     })
     mo.vstack([
         mo.md("## Cohort waterfall"),
-        waterfall,
+        waterfall_df,
     ])
     return
 
