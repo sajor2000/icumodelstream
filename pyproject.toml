@@ -1,0 +1,51 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "icumodelstream"
+version = "0.1.0"
+description = "Local-first CLIF-MIMIC parquet pipeline for ICU Model Stream / CLIF-Navigator."
+readme = "README.md"
+requires-python = ">=3.11"
+authors = [{ name = "ICU Model Stream Contributors" }]
+dependencies = [
+    "duckdb>=0.10",
+    "polars>=0.20",
+    "pyarrow>=15",
+    "pydantic>=2",
+    "pyyaml>=6",
+    "rich>=13",
+    "typer>=0.12",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8",
+    "ruff>=0.5",
+    "mypy>=1.10",
+]
+ml = [
+    "numpy>=1.26",
+    "pandas>=2.2",
+    "scikit-learn>=1.4",
+    "lightgbm>=4.3",
+]
+
+[project.scripts]
+icumodelstream = "icumodelstream.cli:app"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+ignore = ["B008"]  # Typer intentionally uses Option() defaults for CLI declarations.
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]

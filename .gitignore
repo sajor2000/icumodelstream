@@ -1,0 +1,40 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# Environments
+.venv/
+.env
+.env.*
+!.env.example
+
+# Data: never commit CLIF/MIMIC parquet or PHI
+/data/raw/
+/data/interim/
+/data/processed/
+/data/external/
+*.parquet
+*.duckdb
+*.db
+*.sqlite
+*.csv.gz
+*.csv
+
+# Outputs
+/reports/*.html
+/reports/*.json
+/reports/*.csv
+/models/
+/checkpoints/
+/runs/
+
+# OS / IDE
+.DS_Store
+.vscode/
+.idea/

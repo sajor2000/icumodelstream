@@ -1,0 +1,19 @@
+project: icumodelstream
+phase: clif_mimic_parquet_local
+
+data:
+  root: /absolute/path/to/clif_mimic_parquet
+  format: parquet
+  table_glob: "*.parquet"
+
+outputs:
+  report_dir: reports
+  cohort_csv: reports/adult_icu_cohort.csv
+
+cohort:
+  min_age: 18
+  require_icu_location: true
+
+safety:
+  allow_phi: false
+  commit_patient_level_outputs: false
