@@ -21,12 +21,24 @@ def _resolve_data_root(data_root: Path | None) -> Path:
     return data_root.expanduser().resolve()
 
 
+def _discover(data_root: Path) -> dict:
+    """Discover tables, converting common discovery errors into typer.BadParameter."""
+    try:
+        return discover_tables(data_root)
+    except FileNotFoundError as e:
+        raise typer.BadParameter(str(e)) from e
+    except ValueError as e:
+        raise typer.BadParameter(
+            f"{e}\nRename or remove one of the conflicting parquet files."
+        ) from e
+
+
 @app.command()
 def inspect(
     data_root: Path = typer.Option(..., help="Directory containing CLIF parquet files."),
 ) -> None:
     """Inventory parquet tables and validate minimal CLIF contracts."""
-    tables = discover_tables(_resolve_data_root(data_root))
+    tables = _discover(_resolve_data_root(data_root))
     inventory = table_inventory(tables)
 
     rich_table = Table(title="Discovered CLIF parquet tables")
@@ -51,7 +63,7 @@ def qc(
     out: Path = typer.Option(Path("reports/qc_summary.json"), help="Output JSON path."),
 ) -> None:
     """Write a JSON QC report for discovered CLIF parquet tables."""
-    tables = discover_tables(_resolve_data_root(data_root))
+    tables = _discover(_resolve_data_root(data_root))
     report = build_qc_report(tables)
     out_path = write_qc_report(report, out)
     console.print(f"Wrote QC report: {out_path}")
@@ -67,7 +79,7 @@ def cohort(
     ),
 ) -> None:
     """Build the initial adult ICU cohort CSV."""
-    tables = discover_tables(_resolve_data_root(data_root))
+    tables = _discover(_resolve_data_root(data_root))
     df = build_adult_icu_cohort(
         tables, CohortSpec(min_age=min_age, require_icu_location=require_icu_location)
     )

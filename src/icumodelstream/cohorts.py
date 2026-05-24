@@ -62,4 +62,9 @@ def build_adult_icu_cohort(
             base = base.join(icu_stays, on="hospitalization_id", how="inner")
 
     select_cols = [col for col in ("patient_id", "hospitalization_id", age_col) if col is not None]
-    return base.select(select_cols).unique().sort("hospitalization_id").collect()
+    return (
+        base.select(select_cols)
+        .unique(subset=["patient_id", "hospitalization_id"])
+        .sort("hospitalization_id")
+        .collect()
+    )
