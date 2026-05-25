@@ -14,8 +14,12 @@ The first milestone is not a bedside clinical model. It is a clean, reproducible
 | Schema checks | Confirm expected CLIF table/column presence and report gaps. | `src/icumodelstream/schema.py` |
 | QC | Summarize rows, columns, missingness, time ranges, and candidate outliers. | `src/icumodelstream/qc.py` |
 | Cohort | Build a reproducible adult ICU cohort from patient, hospitalization, and ADT-like tables. | `src/icumodelstream/cohorts.py` |
-| Features | Create simple baseline aggregates for later LightGBM and neural models. | `src/icumodelstream/features.py` |
-| CLI | Run inspect, QC, and cohort jobs from the terminal. | `src/icumodelstream/cli.py` |
+| Features | Create simple baseline aggregates for later LightGBM and neural models. | `src/icumodelstream/features.py` (with `aggregate_numeric_table_windowed` for leakage-safe time windows) |
+| Labels | Extract outcomes (in-hospital mortality) from CLIF hospitalization records. | `src/icumodelstream/labels.py` |
+| Splits | Patient-aware train/test split so the same patient never appears in both folds. | `src/icumodelstream/splits.py` |
+| Models | LightGBM + logistic baselines with reproducible seeds, metrics, and calibration check. | `src/icumodelstream/models.py` |
+| Pipeline | One callable that drives cohort → label → features → split → fit → metrics end-to-end. | `src/icumodelstream/pipeline.py` |
+| CLI | Run inspect, QC, cohort, and baseline jobs from the terminal. | `src/icumodelstream/cli.py` |
 
 ## Quick start
 
@@ -42,6 +46,18 @@ Run the first local checks.
 icumodelstream inspect --data-root /path/to/clif_mimic_parquet
 icumodelstream qc --data-root /path/to/clif_mimic_parquet --out reports/qc_summary.json
 icumodelstream cohort --data-root /path/to/clif_mimic_parquet --out reports/adult_icu_cohort.csv
+icumodelstream baseline --data-root /path/to/clif_mimic_parquet
+```
+
+The `baseline` command runs the full Phase 4 pipeline (cohort → in-hospital mortality label →
+first-24h windowed vitals/labs features → patient-aware split → LightGBM + logistic
+regression with calibration). Writes `reports/baseline_metrics.json`,
+`reports/baseline_summary.md`, and `models/baseline_lightgbm.txt`.
+
+For interactive exploration, the same pipeline is also available as a Marimo notebook:
+
+```bash
+make notebook NOTEBOOK=notebooks/05_baseline.py
 ```
 
 ## Data safety

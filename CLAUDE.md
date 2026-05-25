@@ -81,8 +81,12 @@ Use the Mac for CLIF parquet inspection, schema validation, QC, cohort construct
 | `src/icumodelstream/schema.py` | Expected CLIF table/column contracts and validation results. |
 | `src/icumodelstream/qc.py` | Missingness, row counts, basic distributions, and report generation. |
 | `src/icumodelstream/cohorts.py` | Reproducible cohort definitions. |
-| `src/icumodelstream/features.py` | Baseline feature tables. |
-| `src/icumodelstream/cli.py` | Terminal entry points. |
+| `src/icumodelstream/features.py` | Baseline feature tables, including leakage-safe time-windowed aggregation. |
+| `src/icumodelstream/labels.py` | Outcome label extraction (in-hospital mortality, hospice-aware). |
+| `src/icumodelstream/splits.py` | Patient-aware train/test split (CLAUDE.md §8). |
+| `src/icumodelstream/models.py` | LightGBM + logistic baselines with calibration check. |
+| `src/icumodelstream/pipeline.py` | End-to-end Phase 4 orchestration (`run_baseline_pipeline`). |
+| `src/icumodelstream/cli.py` | Terminal entry points (`inspect`, `qc`, `cohort`, `baseline`). |
 | `notebooks/` | Marimo notebooks that demonstrate the pipeline against local CLIF parquet. No core logic. |
 | `tests/` | Toy-data unit tests. No real patient data. |
 | `configs/` | Local configs. Keep private configs untracked. |

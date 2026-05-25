@@ -1,7 +1,7 @@
 VENV = .venv
 PY = $(VENV)/bin/python
 
-.PHONY: install test lint format inspect qc cohort notebook
+.PHONY: install test lint format inspect qc cohort baseline notebook
 
 $(VENV):
 	python3.11 -m venv $(VENV)
@@ -34,3 +34,7 @@ qc:
 cohort:
 	mkdir -p reports
 	icumodelstream cohort --data-root $${CLIF_DATA_ROOT} --out reports/adult_icu_cohort.csv
+
+baseline:
+	mkdir -p reports models
+	icumodelstream baseline --data-root $${CLIF_DATA_ROOT}
