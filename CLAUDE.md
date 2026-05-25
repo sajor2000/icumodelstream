@@ -96,6 +96,17 @@ Use the Mac for CLIF parquet inspection, schema validation, QC, cohort construct
 
 Use Python 3.11+, type hints, `pathlib.Path`, and `polars` lazy scans where possible. Keep public functions documented with short docstrings. Prefer `ruff`, `pytest`, and small fixtures. Avoid notebooks for core logic; notebooks may demonstrate results, but tested code belongs in `src/`.
 
+## Notebook hygiene
+
+Marimo cells are the unit a clinician-engineer reviews one at a time. Apply these rules to every cell in `notebooks/`:
+
+1. **Every cell starts with an explainer.** For data, logic, and rendering cells, the first statement is `mo.md("…")` with 1–2 sentences naming *what* and *why* (e.g., "Apply the adult-ICU age filter and record the surviving row count for the waterfall."). For pure-setup cells (single import line, marimo boilerplate), a one-line `#` comment is enough.
+2. **Aim for under 25 non-blank lines per cell.** When a cell crosses that, split it along the natural seams (compute → derive → render). One idea per cell makes the marimo dependency graph readable and reduces re-execution cost.
+3. **One conceptual responsibility per cell.** A cell that loads data should not also render a plot; a cell that computes a metric should not also write a file. Split, then let the marimo runtime wire them together.
+4. **No silent side effects.** Anything written to disk (CSVs, JSON, model artifacts) lives in a clearly-named cell whose `mo.md` preamble announces the write, and writes only into paths the operator can preview before running.
+
+These rules apply to new cells AND to edits of existing cells — when you touch a cell, leave it conforming.
+
 ## Data safety rules
 
 Treat all real ICU data as sensitive. MIMIC data are credentialed and must follow PhysioNet rules. Rush/local hospital CLIF data may contain PHI and must remain in approved institutional environments. Never push data, credentials, `.env` files, patient-level screenshots, or row-level outputs.

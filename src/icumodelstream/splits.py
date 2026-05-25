@@ -105,7 +105,9 @@ def group_train_test_split(
         best = None
         best_score = float("inf")
         for candidate_seed in range(seed, seed + 32):
-            splitter = GroupShuffleSplit(n_splits=1, test_size=test_size, random_state=candidate_seed)
+            splitter = GroupShuffleSplit(
+                n_splits=1, test_size=test_size, random_state=candidate_seed
+            )
             tr, te = next(splitter.split(np.zeros(len(X)), groups=groups_np))
             if len(te) == 0 or y_np[te].sum() == 0:
                 continue
@@ -116,9 +118,9 @@ def group_train_test_split(
                 best_score = score
         if best is None:
             raise ValueError(
-                "stratify=True: could not find a group split with any positives in the test fold "
-                "after 32 seed attempts. Cohort is too small or prevalence too low for a stratified "
-                "group split; reduce test_size or fall back to stratify=False."
+                "stratify=True: could not find a group split with any positives in the "
+                "test fold after 32 seed attempts. Cohort is too small or prevalence "
+                "too low; reduce test_size or fall back to stratify=False."
             )
         train_idx, test_idx = best
     else:

@@ -6,6 +6,7 @@ app = marimo.App(width="medium")
 
 @app.cell
 def _():
+    # Marimo bootstrap; no rendered output.
     import marimo as mo
     return (mo,)
 
@@ -22,6 +23,15 @@ def _(mo):
 
 @app.cell
 def _(mo):
+    mo.md(
+        "**Step 1.** Load `configs/local.yaml` (falling back to the tracked example) "
+        "and assert that `safety.allow_phi` is False."
+    )
+    return
+
+
+@app.cell
+def _(mo):
     import sys
     from pathlib import Path
     sys.path.insert(0, str(Path(__file__).parent))
@@ -32,10 +42,25 @@ def _(mo):
 
 
 @app.cell
+def _(mo):
+    mo.md(
+        "**Step 2.** Discover every parquet under `config.data.root`, normalising names "
+        "(stripping `clif_`/`clif2_`/etc.) so downstream code keys by bare table names."
+    )
+    return
+
+
+@app.cell
 def _(config, mo):
     from _common import discover_pipeline_tables
     tables = discover_pipeline_tables(config, mo)
     return (tables,)
+
+
+@app.cell
+def _(mo):
+    mo.md("**Step 3.** Build a small inventory (table name, path, column count) for display.")
+    return
 
 
 @app.cell
@@ -51,6 +76,15 @@ def _(inventory, mo):
         mo.md(f"**{len(inventory)} tables discovered**"),
         inventory,
     ])
+    return
+
+
+@app.cell
+def _(mo):
+    mo.md(
+        "**Step 4.** Run the minimal CLIF contract validator against the core tables "
+        "(`patient`, `hospitalization`, `adt`) so missing columns surface here, not deeper."
+    )
     return
 
 

@@ -6,6 +6,7 @@ app = marimo.App(width="medium")
 
 @app.cell
 def _():
+    # Marimo bootstrap; no rendered output.
     import marimo as mo
     import polars as pl
     return (mo, pl)
@@ -33,6 +34,15 @@ def _(mo):
 
 @app.cell
 def _(mo):
+    mo.md(
+        "**Step 1.** Load `configs/local.yaml` (falling back to the tracked example) "
+        "and assert that `safety.allow_phi` is False."
+    )
+    return
+
+
+@app.cell
+def _(mo):
     import sys
     from pathlib import Path
     sys.path.insert(0, str(Path(__file__).parent))
@@ -43,6 +53,12 @@ def _(mo):
 
 
 @app.cell
+def _(mo):
+    mo.md("**Step 2.** Discover the CLIF parquet tables under `config.data.root`.")
+    return
+
+
+@app.cell
 def _(config, mo):
     from _common import discover_pipeline_tables
     tables = discover_pipeline_tables(config, mo)
@@ -50,7 +66,16 @@ def _(config, mo):
 
 
 @app.cell
-def _(config, mo, pl, tables):
+def _(mo):
+    mo.md(
+        "**Step 3a.** Build the adult ICU cohort and capture the waterfall "
+        "(filter-by-filter row counts + which age/ICU columns were resolved)."
+    )
+    return
+
+
+@app.cell
+def _(config, mo, tables):
     from icumodelstream.cohorts import CohortSpec, build_cohort_with_waterfall
     spec = CohortSpec(
         min_age=config.cohort.min_age,
@@ -60,7 +85,20 @@ def _(config, mo, pl, tables):
         cohort, waterfall = build_cohort_with_waterfall(tables, spec)
     except KeyError as e:
         mo.stop(True, mo.md(f"❌ Required CLIF table missing while building cohort: {e}"))
+    return (cohort, waterfall)
 
+
+@app.cell
+def _(mo):
+    mo.md(
+        "**Step 3b.** Derive waterfall step labels that reflect what actually ran "
+        "('Age filter SKIPPED' when no age column was resolved, etc.)."
+    )
+    return
+
+
+@app.cell
+def _(config, waterfall):
     age_step = (
         f"After age ≥ {config.cohort.min_age}"
         if waterfall.age_col_used is not None
@@ -72,6 +110,17 @@ def _(config, mo, pl, tables):
         icu_step = "ICU filter disabled in config"
     else:
         icu_step = "ICU filter SKIPPED — no ADT or location column found"
+    return (age_step, icu_step)
+
+
+@app.cell
+def _(mo):
+    mo.md("**Step 3c.** Render the 4-row waterfall table.")
+    return
+
+
+@app.cell
+def _(age_step, icu_step, mo, pl, waterfall):
     waterfall_df = pl.DataFrame({
         "step": ["All hospitalizations", age_step, icu_step, "Final cohort"],
         "n": [
@@ -86,20 +135,37 @@ def _(config, mo, pl, tables):
         mo.md("## Cohort waterfall"),
         waterfall_df,
     ])
-    return (cohort,)
+    return
 
 
 @app.cell
-def _(cohort, mo, pl, tables):
+def _(mo):
+    mo.md(
+        "**Step 4a.** Extract in-hospital mortality labels (excludes open admissions, "
+        "fails loudly on no-positives) and inner-join onto the cohort."
+    )
+    return
+
+
+@app.cell
+def _(cohort, mo, tables):
     from icumodelstream.labels import extract_mortality_labels
     try:
         labels = extract_mortality_labels(tables, include_hospice=False)
     except (KeyError, ValueError) as e:
         mo.stop(True, mo.md(f"❌ Could not extract mortality labels: {e}"))
-
-    # Inner join keeps only cohort hospitalizations.
     cohort_with_labels = cohort.join(labels, on="hospitalization_id", how="inner")
+    return (cohort_with_labels,)
 
+
+@app.cell
+def _(mo):
+    mo.md("**Step 4b.** Render the class balance (positives / negatives / prevalence).")
+    return
+
+
+@app.cell
+def _(cohort_with_labels, mo, pl):
     n_positive = int(cohort_with_labels["mortality"].sum())
     n_total = cohort_with_labels.height
     n_negative = n_total - n_positive
@@ -108,46 +174,51 @@ def _(cohort, mo, pl, tables):
         "metric": ["n_positive", "n_negative", "prevalence"],
         "value": [float(n_positive), float(n_negative), float(prevalence)],
     })
-    # PHI note: class balance counts only — aggregate, non-PHI.
+    # PHI note: class-balance counts only — aggregate, non-PHI.
     mo.vstack([
         mo.md("## Label class balance (in-hospital mortality)"),
         balance_df,
     ])
-    return (cohort_with_labels,)
+    return
 
 
 @app.cell
-def _(cohort_with_labels, mo, pl, tables):
-    from icumodelstream.io import scan_table
+def _(mo):
+    mo.md(
+        "**Step 5a.** Build first-24h anchors from `admission_dttm`. Required for the "
+        "windowed feature aggregator; missing column fails loudly."
+    )
+    return
+
+
+@app.cell
+def _(cohort_with_labels, mo, tables):
+    from icumodelstream.pipeline import get_admission_anchors
     try:
-        hosp_lf = scan_table(tables, "hospitalization")
-    except KeyError as e:
-        mo.stop(True, mo.md(f"❌ hospitalization table missing for anchors: {e}"))
-
-    hosp_cols = set(hosp_lf.collect_schema().names())
-    if "admission_dttm" not in hosp_cols:
-        mo.stop(
-            True,
-            mo.md(
-                "❌ hospitalization table is missing `admission_dttm`; "
-                "cannot build first-24h windows."
-            ),
-        )
-
-    anchors = (
-        hosp_lf.select("hospitalization_id", "admission_dttm")
-        .collect()
-        .rename({"admission_dttm": "anchor_dttm"})
-        .join(
+        anchors = get_admission_anchors(tables).join(
             cohort_with_labels.select("hospitalization_id"),
             on="hospitalization_id",
             how="inner",
         )
-    )
+    except (KeyError, ValueError) as e:
+        mo.stop(True, mo.md(f"❌ Could not build anchors: {e}"))
+    return (anchors,)
+
+
+@app.cell
+def _(anchors, mo):
     # PHI note: aggregate count only.
     mo.md(f"**Anchors built for {anchors.height:,} cohort hospitalizations.**")
-    _ = pl  # keep pl alive for downstream cells
-    return (anchors,)
+    return
+
+
+@app.cell
+def _(mo):
+    mo.md(
+        "**Step 6a.** Aggregate vitals in the first-24h window into mean/min/max/n. "
+        "Cohort-anchored: hospitalizations with no vitals in the window get null aggregates."
+    )
+    return
 
 
 @app.cell
@@ -175,6 +246,12 @@ def _(anchors, cohort_with_labels, mo, tables):
 
 
 @app.cell
+def _(mo):
+    mo.md("**Step 6b.** Same windowed aggregation for labs.")
+    return
+
+
+@app.cell
 def _(anchors, cohort_with_labels, mo, tables):
     from icumodelstream.features import aggregate_numeric_table_windowed as _agg_windowed
     labs_features, labs_warn = None, None
@@ -199,7 +276,16 @@ def _(anchors, cohort_with_labels, mo, tables):
 
 
 @app.cell
-def _(cohort_with_labels, labs_features, mo, vitals_features):
+def _(mo):
+    mo.md(
+        "**Step 7a.** Combine vitals and labs into one feature matrix (left-join on "
+        "hospitalization_id; both sides are already cohort-anchored)."
+    )
+    return
+
+
+@app.cell
+def _(labs_features, mo, vitals_features):
     if vitals_features is None and labs_features is None:
         mo.stop(
             True,
@@ -211,8 +297,20 @@ def _(cohort_with_labels, labs_features, mo, vitals_features):
         features = vitals_features
     else:
         features = labs_features
+    return (features,)
 
-    # Join labels + patient_id onto features, then peel off X / y / groups.
+
+@app.cell
+def _(mo):
+    mo.md(
+        "**Step 7b.** Join labels + patient_id onto features, then peel off X / y / groups "
+        "for the modeling stage."
+    )
+    return
+
+
+@app.cell
+def _(cohort_with_labels, features):
     full = features.join(
         cohort_with_labels.select("hospitalization_id", "patient_id", "mortality"),
         on="hospitalization_id",
@@ -224,22 +322,33 @@ def _(cohort_with_labels, labs_features, mo, vitals_features):
     X = full.select(feature_cols)
     y = full["mortality"]
     groups = full["patient_id"]
+    return (X, groups, y)
+
+
+@app.cell
+def _(X, groups, mo, y):
     # PHI note: shape / unique-patient counts are aggregate, non-PHI.
     mo.md(
         f"**Feature matrix shape:** {X.shape} | "
         f"**positives:** {int(y.sum()):,} | "
         f"**unique patients:** {groups.n_unique():,}"
     )
-    return (X, groups, y)
+    return
 
 
 @app.cell
-def _(X, groups, mo, pl, y):
-    from icumodelstream.splits import group_train_test_split
+def _(mo):
+    mo.md(
+        "**Step 8a.** Patient-aware train/test split via `group_train_test_split`. We "
+        "smuggle `patient_id` in as a sentinel `__patient_id` column so the same split "
+        "can recover unique-patient counts per side, matching `pipeline.run_baseline_pipeline`."
+    )
+    return
 
-    # Use the same passenger-column pattern as pipeline.run_baseline_pipeline so
-    # any change to the splitter (e.g., stratified-group) flows here automatically
-    # without two parallel call sites drifting apart.
+
+@app.cell
+def _(X, groups, y):
+    from icumodelstream.splits import group_train_test_split
     pid_col = "__patient_id"
     if pid_col in X.columns:
         raise ValueError(f"Reserved sentinel column {pid_col!r} collides with a feature.")
@@ -251,6 +360,17 @@ def _(X, groups, mo, pl, y):
     n_test_patients = int(X_with_pid_test[pid_col].n_unique())
     X_train = X_with_pid_train.drop(pid_col)
     X_test = X_with_pid_test.drop(pid_col)
+    return X_test, X_train, n_test_patients, n_train_patients, y_test, y_train
+
+
+@app.cell
+def _(mo):
+    mo.md("**Step 8b.** Render split sizes and train/test prevalences.")
+    return
+
+
+@app.cell
+def _(X_test, X_train, mo, n_test_patients, n_train_patients, pl, y_test, y_train):
     n_train = X_train.height
     n_test = X_test.height
     train_prevalence = float(y_train.sum()) / n_train if n_train else 0.0
@@ -271,7 +391,13 @@ def _(X, groups, mo, pl, y):
         mo.md("## Patient-aware split"),
         split_df,
     ])
-    return X_test, X_train, y_test, y_train
+    return
+
+
+@app.cell
+def _(mo):
+    mo.md("**Step 9a.** Fit the LightGBM baseline (default hyperparameters, seed=42).")
+    return
 
 
 @app.cell
@@ -284,6 +410,12 @@ def _(X_test, X_train, y_test, y_train):
 
 
 @app.cell
+def _(mo):
+    mo.md("**Step 9b.** Fit the logistic regression baseline with the same split.")
+    return
+
+
+@app.cell
 def _(X_test, X_train, y_test, y_train):
     from icumodelstream.models import fit_logistic_baseline
     logreg_model, logreg_result = fit_logistic_baseline(
@@ -293,22 +425,24 @@ def _(X_test, X_train, y_test, y_train):
 
 
 @app.cell
+def _(mo):
+    mo.md(
+        "**Step 10a.** Tabulate holdout metrics (AUROC, AUPRC, Brier, prevalence, "
+        "calibration intercept/slope) side-by-side for both models."
+    )
+    return
+
+
+@app.cell
 def _(lgbm_result, logreg_result, mo, pl):
     metric_keys = (
-        "auroc",
-        "auprc",
-        "brier_score",
-        "prevalence",
-        "calibration_intercept",
-        "calibration_slope",
+        "auroc", "auprc", "brier_score", "prevalence",
+        "calibration_intercept", "calibration_slope",
     )
     metrics_df = pl.DataFrame({
         "model": ["lightgbm", "logistic"],
         **{
-            key: [
-                float(lgbm_result.metrics[key]),
-                float(logreg_result.metrics[key]),
-            ]
+            key: [float(lgbm_result.metrics[key]), float(logreg_result.metrics[key])]
             for key in metric_keys
         },
     })
@@ -317,6 +451,15 @@ def _(lgbm_result, logreg_result, mo, pl):
         mo.md("## Holdout metrics"),
         metrics_df,
     ])
+    return
+
+
+@app.cell
+def _(mo):
+    mo.md(
+        "**Step 10b.** Render reliability (calibration) tables side-by-side. Fixed-decile "
+        "bins (0.0–1.0) make the two tables directly comparable."
+    )
     return
 
 
@@ -332,13 +475,21 @@ def _(lgbm_result, logreg_result, mo):
 
 
 @app.cell
-def _(lgbm_result, logreg_result, mo):
+def _(mo):
+    mo.md(
+        "**Step 11a.** Pick the better-AUROC model and apply a calibration verdict "
+        "(|intercept|<0.5 and |slope-1|<0.5 → 'reasonably calibrated')."
+    )
+    return
+
+
+@app.cell
+def _(lgbm_result, logreg_result):
     lgbm_auroc = lgbm_result.metrics["auroc"]
     logreg_auroc = logreg_result.metrics["auroc"]
     better = "LightGBM" if lgbm_auroc >= logreg_auroc else "logistic regression"
 
     def _calibration_verdict(intercept: float, slope: float) -> str:
-        # Rough heuristic per the U6 plan: |intercept| < 0.5 and |slope - 1| < 0.5.
         if abs(intercept) < 0.5 and abs(slope - 1.0) < 0.5:
             return "reasonably calibrated"
         return "miscalibrated (expected for an untuned baseline)"
@@ -349,7 +500,23 @@ def _(lgbm_result, logreg_result, mo):
     logreg_slope = logreg_result.metrics["calibration_slope"]
     lgbm_cal = _calibration_verdict(lgbm_int, lgbm_slope)
     logreg_cal = _calibration_verdict(logreg_int, logreg_slope)
+    return (
+        better, lgbm_auroc, lgbm_cal, lgbm_int, lgbm_slope,
+        logreg_auroc, logreg_cal, logreg_int, logreg_slope,
+    )
 
+
+@app.cell
+def _(mo):
+    mo.md("**Step 11b.** Render the human-readable summary + next steps.")
+    return
+
+
+@app.cell
+def _(
+    better, lgbm_auroc, lgbm_cal, lgbm_int, lgbm_slope,
+    logreg_auroc, logreg_cal, logreg_int, logreg_slope, mo,
+):
     mo.md(
         f"""
         ## Summary
