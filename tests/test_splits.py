@@ -21,15 +21,11 @@ def test_group_train_test_split_no_patient_leakage() -> None:
     patient_ids = [f"P{i:03d}" for i in range(50) for _ in range(2)]
     # Embed patient_id as a column so we can recover the split's groups directly
     # from the returned DataFrames -- no need to re-run sklearn.
-    X = pl.DataFrame(
-        {"feat1": [1.0] * 100, "feat2": [2.0] * 100, "patient_id": patient_ids}
-    )
+    X = pl.DataFrame({"feat1": [1.0] * 100, "feat2": [2.0] * 100, "patient_id": patient_ids})
     y = pl.Series("label", [0] * 100)
     groups = pl.Series("patient_id", patient_ids)
 
-    X_train, X_test, y_train, y_test = group_train_test_split(
-        X, y, groups, test_size=0.2, seed=42
-    )
+    X_train, X_test, y_train, y_test = group_train_test_split(X, y, groups, test_size=0.2, seed=42)
 
     train_groups = set(X_train["patient_id"].to_list())
     test_groups = set(X_test["patient_id"].to_list())
@@ -47,15 +43,11 @@ def test_group_train_test_split_single_patient_no_overlap() -> None:
     X, y = _make_xy(10)
     groups = pl.Series("patient_id", ["P1"] * 10)
 
-    X_train, X_test, y_train, y_test = group_train_test_split(
-        X, y, groups, test_size=0.2, seed=0
-    )
+    X_train, X_test, y_train, y_test = group_train_test_split(X, y, groups, test_size=0.2, seed=0)
 
     # With one group, the wrapper puts every row on exactly one side -- never both,
     # so the no-leakage contract is preserved.
-    assert (len(X_train) == 10 and len(X_test) == 0) or (
-        len(X_train) == 0 and len(X_test) == 10
-    )
+    assert (len(X_train) == 10 and len(X_test) == 0) or (len(X_train) == 0 and len(X_test) == 10)
     assert len(y_train) == len(X_train)
     assert len(y_test) == len(X_test)
     # Intersection is trivially empty because one side is empty.
@@ -67,9 +59,7 @@ def test_group_train_test_split_reproducible_and_seed_sensitive() -> None:
     # 10 patients, 1 row each, test_size=0.5 => 5-vs-5 contrast is visible.
     patient_ids = [f"P{i}" for i in range(10)]
     # Embed patient_id as a feature column so we can recover assignments per call.
-    X = pl.DataFrame(
-        {"feat1": [1.0] * 10, "feat2": [2.0] * 10, "patient_id": patient_ids}
-    )
+    X = pl.DataFrame({"feat1": [1.0] * 10, "feat2": [2.0] * 10, "patient_id": patient_ids})
     y = pl.Series("label", [0] * 10)
     groups = pl.Series("patient_id", patient_ids)
 

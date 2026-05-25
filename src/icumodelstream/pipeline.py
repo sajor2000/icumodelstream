@@ -57,15 +57,35 @@ from icumodelstream.splits import group_train_test_split
 # list can grow without breaking the pipeline.
 
 RICH_VITAL_CATEGORIES: tuple[str, ...] = (
-    "heart_rate", "sbp", "dbp", "map", "respiratory_rate", "spo2", "temp_c",
+    "heart_rate",
+    "sbp",
+    "dbp",
+    "map",
+    "respiratory_rate",
+    "spo2",
+    "temp_c",
 )
 RICH_LAB_CATEGORIES: tuple[str, ...] = (
-    "sodium", "potassium", "chloride", "bicarbonate", "bun", "creatinine",
-    "glucose_serum", "calcium_total", "magnesium", "lactate", "hemoglobin", "wbc",
+    "sodium",
+    "potassium",
+    "chloride",
+    "bicarbonate",
+    "bun",
+    "creatinine",
+    "glucose_serum",
+    "calcium_total",
+    "magnesium",
+    "lactate",
+    "hemoglobin",
+    "wbc",
 )
 RICH_ASSESSMENT_CATEGORIES: tuple[str, ...] = ("gcs_total", "RASS")
 RICH_RESPIRATORY_DEVICES: tuple[str, ...] = (
-    "IMV", "NIPPV", "High Flow NC", "Nasal Cannula", "CPAP",
+    "IMV",
+    "NIPPV",
+    "High Flow NC",
+    "Nasal Cannula",
+    "CPAP",
 )
 
 
@@ -164,9 +184,7 @@ def _build_feature_matrix(
     vitals = _try_windowed_features(
         tables, "vitals", "vitals", anchors, window_hours, cohort, warnings
     )
-    labs = _try_windowed_features(
-        tables, "labs", "labs", anchors, window_hours, cohort, warnings
-    )
+    labs = _try_windowed_features(tables, "labs", "labs", anchors, window_hours, cohort, warnings)
 
     if vitals is not None and labs is not None:
         matrix = vitals.join(labs, on="hospitalization_id", how="left")
@@ -194,9 +212,7 @@ def _try_per_category(
 ) -> pl.DataFrame | None:
     """Per-category windowed aggregation with graceful skip on missing table."""
     if table_name not in tables:
-        warnings.append(
-            f"{table_name} table not found; skipping per-category features."
-        )
+        warnings.append(f"{table_name} table not found; skipping per-category features.")
         return None
     try:
         return aggregate_numeric_table_per_category(
@@ -210,9 +226,7 @@ def _try_per_category(
             cohort=cohort,
         )
     except ValueError as e:
-        warnings.append(
-            f"{table_name} per-category features skipped: {type(e).__name__}: {e}"
-        )
+        warnings.append(f"{table_name} per-category features skipped: {type(e).__name__}: {e}")
         return None
 
 
@@ -234,23 +248,43 @@ def _build_rich_feature_matrix(
     parts: list[pl.DataFrame] = []
 
     vitals = _try_per_category(
-        tables, "vitals", "vital_category", RICH_VITAL_CATEGORIES,
-        "vitals_{category}", anchors, window_hours, cohort, warnings,
+        tables,
+        "vitals",
+        "vital_category",
+        RICH_VITAL_CATEGORIES,
+        "vitals_{category}",
+        anchors,
+        window_hours,
+        cohort,
+        warnings,
     )
     if vitals is not None:
         parts.append(vitals)
 
     labs = _try_per_category(
-        tables, "labs", "lab_category", RICH_LAB_CATEGORIES,
-        "labs_{category}", anchors, window_hours, cohort, warnings,
+        tables,
+        "labs",
+        "lab_category",
+        RICH_LAB_CATEGORIES,
+        "labs_{category}",
+        anchors,
+        window_hours,
+        cohort,
+        warnings,
     )
     if labs is not None:
         parts.append(labs)
 
     assessments = _try_per_category(
-        tables, "patient_assessments", "assessment_category",
-        RICH_ASSESSMENT_CATEGORIES, "assess_{category}",
-        anchors, window_hours, cohort, warnings,
+        tables,
+        "patient_assessments",
+        "assessment_category",
+        RICH_ASSESSMENT_CATEGORIES,
+        "assess_{category}",
+        anchors,
+        window_hours,
+        cohort,
+        warnings,
     )
     if assessments is not None:
         parts.append(assessments)
@@ -266,13 +300,9 @@ def _build_rich_feature_matrix(
             )
             parts.append(resp)
         except ValueError as e:
-            warnings.append(
-                f"respiratory_support indicators skipped: {type(e).__name__}: {e}"
-            )
+            warnings.append(f"respiratory_support indicators skipped: {type(e).__name__}: {e}")
     else:
-        warnings.append(
-            "respiratory_support table not found; skipping IMV/NIPPV/CPAP flags."
-        )
+        warnings.append("respiratory_support table not found; skipping IMV/NIPPV/CPAP flags.")
 
     if not parts:
         return pl.DataFrame({"hospitalization_id": []}), [], warnings
@@ -336,13 +366,9 @@ def run_baseline_pipeline(
         or an unrecognized ``feature_set``.
     """
     if feature_set not in {"basic", "rich"}:
-        raise ValueError(
-            f"feature_set must be 'basic' or 'rich', got {feature_set!r}."
-        )
+        raise ValueError(f"feature_set must be 'basic' or 'rich', got {feature_set!r}.")
     if outcome not in {"mortality", "los_gt_7d"}:
-        raise ValueError(
-            f"outcome must be 'mortality' or 'los_gt_7d', got {outcome!r}."
-        )
+        raise ValueError(f"outcome must be 'mortality' or 'los_gt_7d', got {outcome!r}.")
 
     config_snapshot: dict[str, Any] = {
         "cohort_spec": asdict(cohort_spec),
@@ -448,9 +474,7 @@ def run_baseline_pipeline(
     lightgbm_model, lightgbm_result = fit_lightgbm_baseline(
         X_train, y_train, X_test, y_test, seed=seed
     )
-    _, logistic_result = fit_logistic_baseline(
-        X_train, y_train, X_test, y_test, seed=seed
-    )
+    _, logistic_result = fit_logistic_baseline(X_train, y_train, X_test, y_test, seed=seed)
 
     return BaselinePipelineResult(
         cohort_waterfall=waterfall,
@@ -591,9 +615,7 @@ def run_sequence_baseline_pipeline(
     from icumodelstream.torch_train import fit_sequence_model, prepare_split_tensors
 
     if outcome not in {"mortality", "los_gt_7d"}:
-        raise ValueError(
-            f"outcome must be 'mortality' or 'los_gt_7d', got {outcome!r}."
-        )
+        raise ValueError(f"outcome must be 'mortality' or 'los_gt_7d', got {outcome!r}.")
 
     config_snapshot: dict[str, Any] = {
         "cohort_spec": asdict(cohort_spec),
@@ -681,21 +703,13 @@ def run_sequence_baseline_pipeline(
     # (prepare_split_tensors) without forcing a refactor to expose val/test
     # prevalences on SequenceResult. The split is deterministic under same seed
     # so both call sites produce identical folds.
-    split_tensors = prepare_split_tensors(
-        sequences, labels_for_torch, groups_for_torch, seed=seed
-    )
+    split_tensors = prepare_split_tensors(sequences, labels_for_torch, groups_for_torch, seed=seed)
     n_train = int(split_tensors.X_train.shape[0])
     n_val = int(split_tensors.X_val.shape[0])
     n_test = int(split_tensors.X_test.shape[0])
-    train_prevalence = (
-        float(split_tensors.y_train.mean().item()) if n_train > 0 else 0.0
-    )
-    val_prevalence = (
-        float(split_tensors.y_val.mean().item()) if n_val > 0 else 0.0
-    )
-    test_prevalence = (
-        float(split_tensors.y_test.mean().item()) if n_test > 0 else 0.0
-    )
+    train_prevalence = float(split_tensors.y_train.mean().item()) if n_train > 0 else 0.0
+    val_prevalence = float(split_tensors.y_val.mean().item()) if n_val > 0 else 0.0
+    test_prevalence = float(split_tensors.y_test.mean().item()) if n_test > 0 else 0.0
 
     lstm_model, lstm_result = fit_sequence_model(
         sequences,

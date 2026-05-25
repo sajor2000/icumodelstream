@@ -5,9 +5,9 @@ import polars as pl
 from icumodelstream.io import TableRef, scan_table
 
 VALUE_CANDIDATES = (
-    "vital_value",        # CLIF 2.1 vitals table
+    "vital_value",  # CLIF 2.1 vitals table
     "lab_value_numeric",  # CLIF 2.1 labs table
-    "numerical_value",    # CLIF 2.1 patient_assessments table (note "numerical_" suffix)
+    "numerical_value",  # CLIF 2.1 patient_assessments table (note "numerical_" suffix)
     "value",
     "numeric_value",
     "measurement_value",
@@ -15,19 +15,19 @@ VALUE_CANDIDATES = (
 )
 NAME_CANDIDATES = ("name", "variable", "lab_name", "vital_name", "category")
 DATETIME_CANDIDATES = (
-    "recorded_dttm",        # vitals / patient_assessments — point-of-care entry
+    "recorded_dttm",  # vitals / patient_assessments — point-of-care entry
     # NB: For labs we prefer order/collect time over result time. result_dttm is
     # when the result returned, which can be many hours after the sample was
     # drawn — labs drawn inside an early prediction window but resulting late
     # would be silently excluded if we keyed on result time. Tradeoff: in clinical
     # production an early-warning model only knows results that have already come
     # back; if you need that strict semantics, override by editing this tuple.
-    "lab_collect_dttm",     # labs — when sample was drawn (preferred)
-    "lab_order_dttm",       # labs — when order was placed (next-best)
-    "lab_result_dttm",      # labs — when result returned (fallback only)
+    "lab_collect_dttm",  # labs — when sample was drawn (preferred)
+    "lab_order_dttm",  # labs — when order was placed (next-best)
+    "lab_result_dttm",  # labs — when result returned (fallback only)
     "obs_dttm",
     "measurement_dttm",
-    "admin_dttm",           # medication tables
+    "admin_dttm",  # medication tables
 )
 
 
@@ -57,11 +57,15 @@ def aggregate_numeric_table(
     if value_col is None or "hospitalization_id" not in columns:
         raise ValueError(f"{table_name} must contain hospitalization_id and a numeric value column")
 
-    counts = lf.select(
-        pl.len().alias("n_total"),
-        pl.col(value_col).is_not_null().sum().alias("n_non_null"),
-        pl.col(value_col).cast(pl.Float64, strict=False).is_not_null().sum().alias("n_numeric"),
-    ).collect().row(0, named=True)
+    counts = (
+        lf.select(
+            pl.len().alias("n_total"),
+            pl.col(value_col).is_not_null().sum().alias("n_non_null"),
+            pl.col(value_col).cast(pl.Float64, strict=False).is_not_null().sum().alias("n_numeric"),
+        )
+        .collect()
+        .row(0, named=True)
+    )
     n_non_null = counts["n_non_null"]
     n_parse_failures = n_non_null - counts["n_numeric"]
     if n_non_null > 0:
@@ -157,9 +161,7 @@ def aggregate_numeric_table_windowed(
         )
     anchor_dtype = anchors.schema["anchor_dttm"]
     if not isinstance(anchor_dtype, pl.Datetime):
-        raise ValueError(
-            f"anchors.anchor_dttm must be Datetime, got {anchor_dtype}."
-        )
+        raise ValueError(f"anchors.anchor_dttm must be Datetime, got {anchor_dtype}.")
     # Both must be tz-aware (same tz) or both naive. Mismatched tz silently
     # mis-aligns windows -- fail loudly per CLAUDE.md rule 7.
     if ts_dtype.time_zone != anchor_dtype.time_zone:
@@ -179,10 +181,14 @@ def aggregate_numeric_table_windowed(
         )
 
     # Validate parseability on the full source (same contract as the unwindowed variant).
-    counts = lf.select(
-        pl.col(value_col).is_not_null().sum().alias("n_non_null"),
-        pl.col(value_col).cast(pl.Float64, strict=False).is_not_null().sum().alias("n_numeric"),
-    ).collect().row(0, named=True)
+    counts = (
+        lf.select(
+            pl.col(value_col).is_not_null().sum().alias("n_non_null"),
+            pl.col(value_col).cast(pl.Float64, strict=False).is_not_null().sum().alias("n_numeric"),
+        )
+        .collect()
+        .row(0, named=True)
+    )
     n_non_null = counts["n_non_null"]
     n_parse_failures = n_non_null - counts["n_numeric"]
     if n_non_null > 0:
@@ -271,9 +277,7 @@ def aggregate_numeric_table_per_category(
     if "hospitalization_id" not in columns:
         raise ValueError(f"{table_name} must contain hospitalization_id")
     if category_column not in columns:
-        raise ValueError(
-            f"{table_name}.{category_column} not found; observed: {sorted(columns)}."
-        )
+        raise ValueError(f"{table_name}.{category_column} not found; observed: {sorted(columns)}.")
 
     ts_col = _first_existing(columns, DATETIME_CANDIDATES)
     if ts_col is None:
@@ -283,16 +287,12 @@ def aggregate_numeric_table_per_category(
         )
     ts_dtype = schema[ts_col]
     if not isinstance(ts_dtype, pl.Datetime):
-        raise ValueError(
-            f"{table_name}.{ts_col} must be Datetime for windowing, got {ts_dtype}."
-        )
+        raise ValueError(f"{table_name}.{ts_col} must be Datetime for windowing, got {ts_dtype}.")
 
     required_anchor_cols = {"hospitalization_id", "anchor_dttm"}
     missing = required_anchor_cols - set(anchors.columns)
     if missing:
-        raise ValueError(
-            f"anchors is missing required columns: {sorted(missing)}."
-        )
+        raise ValueError(f"anchors is missing required columns: {sorted(missing)}.")
     anchor_dtype = anchors.schema["anchor_dttm"]
     if ts_dtype.time_zone != anchor_dtype.time_zone:
         raise ValueError(

@@ -23,14 +23,16 @@ DISCHARGE_CATEGORY_CANDIDATES = (
     "discharge_disposition",
     "discharge_to",
 )
-MORTALITY_VALUES = frozenset({
-    "expired",          # CLIF 2.x / MIMIC canonical
-    "died",
-    "deceased",
-    "death",
-    "dead/expired",     # Rush-CLIF variant
-    "expired in hospital",
-})
+MORTALITY_VALUES = frozenset(
+    {
+        "expired",  # CLIF 2.x / MIMIC canonical
+        "died",
+        "deceased",
+        "death",
+        "dead/expired",  # Rush-CLIF variant
+        "expired in hospital",
+    }
+)
 HOSPICE_VALUES = frozenset({"hospice", "discharged to hospice"})
 
 
@@ -103,9 +105,7 @@ def extract_mortality_labels(
     return result
 
 
-def extract_los_label(
-    tables: dict[str, TableRef], threshold_hours: float = 168.0
-) -> pl.DataFrame:
+def extract_los_label(tables: dict[str, TableRef], threshold_hours: float = 168.0) -> pl.DataFrame:
     """Return one row per hospitalization with a "long length of stay" label.
 
     LOS is computed as ``discharge_dttm - admission_dttm``. Hospitalizations
@@ -136,9 +136,7 @@ def extract_los_label(
         hospitalization table (CLAUDE.md rule 7).
     """
     if threshold_hours <= 0:
-        raise ValueError(
-            f"threshold_hours must be positive, got {threshold_hours}."
-        )
+        raise ValueError(f"threshold_hours must be positive, got {threshold_hours}.")
 
     lf = scan_table(tables, "hospitalization")
     columns = set(lf.collect_schema().names())
@@ -150,10 +148,7 @@ def extract_los_label(
         )
 
     result = (
-        lf.filter(
-            pl.col("admission_dttm").is_not_null()
-            & pl.col("discharge_dttm").is_not_null()
-        )
+        lf.filter(pl.col("admission_dttm").is_not_null() & pl.col("discharge_dttm").is_not_null())
         .select(
             pl.col("hospitalization_id"),
             (
@@ -172,3 +167,55 @@ def extract_los_label(
     )
 
     return result
+
+
+DEATH_DISPOSITION_VALUES = {
+    "death",
+    "deceased",
+    "expired",
+    "died",
+    "dead",
+}
+
+
+def derive_in_hospital_mortality(
+    hospitalizations: pl.DataFrame,
+    id_col: str = "hospitalization_id",
+    disposition_col: str | None = None,
+    death_time_col: str | None = None,
+) -> pl.DataFrame:
+    """Derive binary in-hospital mortality from a concrete hospitalization frame.
+
+    This small helper is useful for toy-data and external prediction-file tests.
+    The production CLIF-MIMIC path should prefer ``extract_mortality_labels`` because
+    it resolves known CLIF-MIMIC disposition columns from discovered parquet tables.
+    """
+    if id_col not in hospitalizations.columns:
+        raise ValueError(f"Missing hospitalization identifier column: {id_col}")
+
+    exprs: list[pl.Expr] = []
+    if disposition_col and disposition_col in hospitalizations.columns:
+        exprs.append(
+            pl.col(disposition_col)
+            .cast(pl.Utf8)
+            .str.to_lowercase()
+            .str.strip_chars()
+            .is_in(DEATH_DISPOSITION_VALUES)
+        )
+    if death_time_col and death_time_col in hospitalizations.columns:
+        exprs.append(pl.col(death_time_col).is_not_null())
+
+    if not exprs:
+        raise ValueError(
+            "Could not derive mortality label: provide an existing disposition_col "
+            "or death_time_col."
+        )
+
+    event_expr = exprs[0]
+    for expr in exprs[1:]:
+        event_expr = event_expr | expr
+
+    return hospitalizations.select(
+        pl.col(id_col),
+        event_expr.cast(pl.Int8).alias("in_hospital_mortality"),
+    ).unique(id_col, keep="first")

@@ -95,9 +95,7 @@ def test_different_seeds_give_different_outputs() -> None:
 def test_bidirectional_doubles_classifier_input_features() -> None:
     """Bidirectional LSTM head must consume 2 * hidden_dim features."""
     torch.manual_seed(42)
-    model = LSTMBaseline(
-        input_dim=10, hidden_dim=32, n_layers=2, bidirectional=True
-    )
+    model = LSTMBaseline(input_dim=10, hidden_dim=32, n_layers=2, bidirectional=True)
     model.eval()
 
     # Linear head is sized for both directions.

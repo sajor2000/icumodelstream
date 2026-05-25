@@ -61,9 +61,7 @@ def build_cohort_with_waterfall(
     hosp_cols = set(hospitalization.collect_schema().names())
     age_col = first_existing_column(patient_cols | hosp_cols, AGE_CANDIDATES)
 
-    total = (
-        hospitalization.select(pl.col("hospitalization_id").n_unique()).collect().item()
-    )
+    total = hospitalization.select(pl.col("hospitalization_id").n_unique()).collect().item()
 
     base = hospitalization.join(patient, on="patient_id", how="left")
     if age_col is not None:

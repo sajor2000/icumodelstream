@@ -3,17 +3,24 @@ from __future__ import annotations
 import json
 import subprocess
 from dataclasses import asdict
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+import polars as pl
 import typer
 from rich.console import Console
 from rich.table import Table
 
 from icumodelstream.cohorts import CohortSpec, build_adult_icu_cohort, build_cohort_with_waterfall
+from icumodelstream.decision_curve import decision_curve as compute_decision_curve
 from icumodelstream.io import discover_tables, scan_table, table_inventory
 from icumodelstream.labels import extract_los_label, extract_mortality_labels
+from icumodelstream.metrics import (
+    binary_classification_metrics,
+    calibration_table,
+    expected_calibration_error,
+)
 from icumodelstream.models import BaselineResult, save_model
 from icumodelstream.pipeline import (
     RICH_ASSESSMENT_CATEGORIES,
@@ -27,6 +34,7 @@ from icumodelstream.pipeline import (
 from icumodelstream.qc import build_qc_report, write_qc_report
 from icumodelstream.schema import validate_table_contracts, validation_results_to_frame
 from icumodelstream.sequences import build_sequence_tensors
+from icumodelstream.subgroups import subgroup_performance
 from icumodelstream.torch_train import fit_sequence_model, prepare_split_tensors
 
 app = typer.Typer(help="Local-first CLIF-MIMIC parquet pipeline.")
@@ -49,6 +57,15 @@ def _discover(data_root: Path) -> dict:
         raise typer.BadParameter(
             f"{e}\nRename or remove one of the conflicting parquet files."
         ) from e
+
+
+def _read_frame(path: Path) -> pl.DataFrame:
+    suffix = path.suffix.lower()
+    if suffix == ".parquet":
+        return pl.read_parquet(path)
+    if suffix == ".csv":
+        return pl.read_csv(path)
+    raise typer.BadParameter(f"Unsupported file type for {path}; expected .csv or .parquet")
 
 
 @app.command()
@@ -134,6 +151,7 @@ def _git_head_sha() -> str | None:
 def _nan_to_none(obj: Any) -> Any:
     """Recursively convert NaN floats to None for strict-JSON output (RFC 8259)."""
     import math
+
     if isinstance(obj, float) and math.isnan(obj):
         return None
     if isinstance(obj, dict):
@@ -267,9 +285,7 @@ def _build_markdown_summary(
     lines.append("| Param | Value |")
     lines.append("|---|---|")
     lines.append(f"| min_age | {cohort_spec['min_age']} |")
-    lines.append(
-        f"| require_icu_location | {str(cohort_spec['require_icu_location']).lower()} |"
-    )
+    lines.append(f"| require_icu_location | {str(cohort_spec['require_icu_location']).lower()} |")
     lines.append(f"| window_hours | {config['window_hours']} |")
     lines.append(f"| test_size | {config['test_size']} |")
     lines.append(f"| seed | {config['seed']} |")
@@ -356,9 +372,7 @@ def _build_markdown_summary(
     lines.append("## Artifacts")
     lines.append("")
     lines.append(f"- Metrics JSON: `{metrics_out}`")
-    lines.append(
-        f"- LightGBM model: `{model_out}` (load via `lightgbm.Booster(model_file=...)`)"
-    )
+    lines.append(f"- LightGBM model: `{model_out}` (load via `lightgbm.Booster(model_file=...)`)")
     lines.append("")
     lines.append("---")
     lines.append("")
@@ -379,23 +393,18 @@ def _print_baseline_terminal_summary(
     total_patients = result.n_train_patients + result.n_test_patients
     cohort_n = result.cohort_waterfall.final
     console.print("=== Baseline complete ===")
-    console.print(
-        f"Cohort:    {cohort_n:,} hospitalizations ({total_patients:,} unique patients)"
-    )
+    console.print(f"Cohort:    {cohort_n:,} hospitalizations ({total_patients:,} unique patients)")
     console.print(
         f"Features:  {result.n_features} (vitals + labs aggregates, "
         f"first {result.config_snapshot['window_hours']}h)"
     )
-    console.print(
-        f"Split:     {result.n_train:,} train / {result.n_test:,} test (by patient_id)"
-    )
+    console.print(f"Split:     {result.n_train:,} train / {result.n_test:,} test (by patient_id)")
     outcome_label = {
         "mortality": "Mortality",
         "los_gt_7d": "LOS > 7d",
     }.get(result.config_snapshot.get("outcome", "mortality"), "Outcome")
     console.print(
-        f"{outcome_label}: {result.train_prevalence:.1%} train, "
-        f"{result.test_prevalence:.1%} test"
+        f"{outcome_label}: {result.train_prevalence:.1%} train, {result.test_prevalence:.1%} test"
     )
     console.print("")
     lgbm = result.lightgbm.metrics
@@ -440,9 +449,7 @@ def baseline(
     ),
     test_size: float = typer.Option(0.2, help="Holdout fraction (split by patient_id)."),
     seed: int = typer.Option(42, help="Random seed for split + model training."),
-    include_hospice: bool = typer.Option(
-        False, help="Treat 'Hospice' discharge as mortality=1."
-    ),
+    include_hospice: bool = typer.Option(False, help="Treat 'Hospice' discharge as mortality=1."),
     feature_set: str = typer.Option(
         "basic",
         help="Feature richness. 'basic' = 8 aggregate vitals+labs columns; "
@@ -476,7 +483,7 @@ def baseline(
         los_threshold_hours=los_threshold_hours,
     )
 
-    generated_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    generated_at = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
     code_version = _git_head_sha()
     payload = _build_metrics_payload(
         data_root=resolved_root,
@@ -493,9 +500,7 @@ def baseline(
         json.dumps(_nan_to_none(payload), indent=2, sort_keys=False, allow_nan=False)
     )
     summary_out.write_text(
-        _build_markdown_summary(
-            payload=payload, metrics_out=metrics_out, model_out=model_out
-        )
+        _build_markdown_summary(payload=payload, metrics_out=metrics_out, model_out=model_out)
     )
     save_model(result.lightgbm_model, model_out)
 
@@ -548,9 +553,7 @@ def _run_sequence_baseline(
     fit_sequence_model expects.
     """
     if outcome not in {"mortality", "los_gt_7d"}:
-        raise typer.BadParameter(
-            f"outcome must be 'mortality' or 'los_gt_7d', got {outcome!r}."
-        )
+        raise typer.BadParameter(f"outcome must be 'mortality' or 'los_gt_7d', got {outcome!r}.")
 
     cohort, waterfall = build_cohort_with_waterfall(tables, cohort_spec)
     if cohort.height == 0:
@@ -580,6 +583,7 @@ def _run_sequence_baseline(
     # early death (mortality=1) and short stay (long_los=0). Drop them so the
     # model can't learn the mask-as-label artifact.
     import polars as _pl
+
     hosp_lf = scan_table(tables, "hospitalization")
     hosp_cols = set(hosp_lf.collect_schema().names())
     if {"admission_dttm", "discharge_dttm"}.issubset(hosp_cols):
@@ -632,9 +636,7 @@ def _run_sequence_baseline(
     # Reproduce the split once for prevalences. fit_sequence_model runs the same
     # deterministic split internally; this call is cheap (no training) and keeps
     # split metadata accessible without changing fit_sequence_model's contract.
-    split_tensors = prepare_split_tensors(
-        sequences, labels_for_torch, groups_for_torch, seed=seed
-    )
+    split_tensors = prepare_split_tensors(sequences, labels_for_torch, groups_for_torch, seed=seed)
     split_meta = {
         "n_train": int(split_tensors.X_train.shape[0]),
         "n_val": int(split_tensors.X_val.shape[0]),
@@ -780,9 +782,7 @@ def _build_sequence_markdown_summary(
     lines.append("## Training")
     lines.append("")
     lines.append(f"- Epochs trained: {training['epochs_trained']}")
-    lines.append(
-        f"- Early stopped at epoch: {training['early_stopped_at_epoch']}"
-    )
+    lines.append(f"- Early stopped at epoch: {training['early_stopped_at_epoch']}")
     lines.append("")
     lines.append(_render_calibration_md("LSTM reliability", model["calibration_table"]))
     lines.append("")
@@ -822,9 +822,7 @@ def sequence_baseline(
         168.0,
         help="LOS threshold in hours when --outcome=los_gt_7d. Default 168 = 7 days.",
     ),
-    include_hospice: bool = typer.Option(
-        False, help="Treat 'Hospice' discharge as mortality=1."
-    ),
+    include_hospice: bool = typer.Option(False, help="Treat 'Hospice' discharge as mortality=1."),
     hidden_dim: int = typer.Option(128, help="LSTM hidden dim."),
     n_layers: int = typer.Option(2, help="LSTM layer count."),
     dropout: float = typer.Option(0.3, help="LSTM dropout (between layers + before classifier)."),
@@ -909,7 +907,7 @@ def sequence_baseline(
         "torch_version": torch.__version__,
     }
 
-    generated_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    generated_at = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
     code_version = _git_head_sha()
     payload = _build_sequence_metrics_payload(
         data_root=resolved_root,
@@ -943,9 +941,7 @@ def sequence_baseline(
         f"{split_meta['n_val']:,} val / "
         f"{split_meta['n_test']:,} test (by patient_id)"
     )
-    outcome_label = {"mortality": "Mortality", "los_gt_7d": "LOS > 7d"}.get(
-        outcome, "Outcome"
-    )
+    outcome_label = {"mortality": "Mortality", "los_gt_7d": "LOS > 7d"}.get(outcome, "Outcome")
     console.print(
         f"{outcome_label}: {split_meta['train_prevalence']:.1%} train, "
         f"{split_meta['test_prevalence']:.1%} test"
@@ -966,6 +962,54 @@ def sequence_baseline(
     console.print(f"Wrote {metrics_out}")
     console.print(f"Wrote {summary_out}")
     console.print(f"Wrote {model_out}")
+
+
+@app.command("evaluate-predictions")
+def evaluate_predictions(
+    predictions: Path = typer.Option(
+        ..., help="CSV or parquet with binary labels and risk scores."
+    ),
+    out: Path = typer.Option(Path("reports/prediction_metrics.json"), help="Output JSON path."),
+    label_col: str = typer.Option("in_hospital_mortality", help="Binary label column."),
+    score_col: str = typer.Option("predicted_risk", help="Predicted probability column."),
+    subgroup_cols: list[str] = typer.Option(None, help="Optional subgroup columns."),
+    calibration_bins: int = typer.Option(10, help="Number of calibration bins."),
+) -> None:
+    """Evaluate saved prediction files with AUROC, Brier, calibration, and subgroups."""
+    frame = _read_frame(predictions)
+    metrics = binary_classification_metrics(
+        frame[label_col].to_numpy(), frame[score_col].to_numpy()
+    )
+    cal = calibration_table(frame, label_col, score_col, n_bins=calibration_bins)
+    report = {
+        "overall": metrics.to_dict(),
+        "calibration": {
+            "expected_calibration_error": expected_calibration_error(cal),
+            "bins": cal.to_dicts(),
+        },
+        "subgroups": subgroup_performance(frame, label_col, score_col, subgroup_cols or []),
+    }
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(json.dumps(report, indent=2), encoding="utf-8")
+    console.print(f"Wrote prediction evaluation report: {out}")
+
+
+@app.command("decision-curve")
+def decision_curve(
+    predictions: Path = typer.Option(
+        ..., help="CSV or parquet with binary labels and risk scores."
+    ),
+    out: Path = typer.Option(Path("reports/decision_curve.json"), help="Output JSON path."),
+    label_col: str = typer.Option("in_hospital_mortality", help="Binary label column."),
+    score_col: str = typer.Option("predicted_risk", help="Predicted probability column."),
+    thresholds: list[float] = typer.Option(None, help="Clinical risk thresholds, e.g. 0.05."),
+) -> None:
+    """Compute decision-curve net benefit for saved prediction files."""
+    frame = _read_frame(predictions)
+    curve = compute_decision_curve(frame, label_col, score_col, thresholds=thresholds)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(json.dumps({"decision_curve": curve.to_dicts()}, indent=2), encoding="utf-8")
+    console.print(f"Wrote decision-curve report: {out}")
 
 
 if __name__ == "__main__":

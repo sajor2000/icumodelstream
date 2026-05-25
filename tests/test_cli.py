@@ -13,7 +13,7 @@ rule 3), and the helper is small enough to read inline.
 from __future__ import annotations
 
 import json
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import lightgbm as lgb
@@ -35,7 +35,7 @@ def _build_toy_clif(
     patient_ids = [f"P{i:03d}" for i in range(n_patients)]
     hospitalization_ids = [f"H{i:03d}" for i in range(n_patients)]
     ages = [25 + (i % 50) for i in range(n_patients)]
-    admission_base = datetime(2024, 1, 1, 0, 0, tzinfo=timezone.utc)
+    admission_base = datetime(2024, 1, 1, 0, 0, tzinfo=UTC)
     admission_dttms = [admission_base + timedelta(days=i) for i in range(n_patients)]
     discharge_dttms = [adm + timedelta(days=5) for adm in admission_dttms]
 
@@ -69,7 +69,7 @@ def _build_toy_clif(
     vital_ids: list[str] = []
     vital_dttms: list[datetime] = []
     vital_values: list[float] = []
-    for hid, adm, expired in zip(hospitalization_ids, admission_dttms, is_expired):
+    for hid, adm, expired in zip(hospitalization_ids, admission_dttms, is_expired, strict=True):
         base_value = 100.0 if expired else 80.0
         for hours in range(0, 24, 2):
             vital_ids.append(hid)
@@ -88,7 +88,7 @@ def _build_toy_clif(
     lab_ids: list[str] = []
     lab_dttms: list[datetime] = []
     lab_values: list[float] = []
-    for hid, adm, expired in zip(hospitalization_ids, admission_dttms, is_expired):
+    for hid, adm, expired in zip(hospitalization_ids, admission_dttms, is_expired, strict=True):
         base_value = 2.5 if expired else 1.0
         for step in range(5):
             lab_ids.append(hid)
@@ -100,9 +100,9 @@ def _build_toy_clif(
             "lab_result_dttm": lab_dttms,
             "value": lab_values,
         }
-    ).with_columns(
-        pl.col("lab_result_dttm").cast(pl.Datetime(time_zone="UTC"))
-    ).write_parquet(tmp_path / "labs.parquet")
+    ).with_columns(pl.col("lab_result_dttm").cast(pl.Datetime(time_zone="UTC"))).write_parquet(
+        tmp_path / "labs.parquet"
+    )
 
 
 def test_baseline_command_happy_path(tmp_path: Path) -> None:
@@ -212,8 +212,12 @@ def test_baseline_command_reproducible_across_invocations(tmp_path: Path) -> Non
     p1 = _run("a")
     p2 = _run("b")
 
-    assert p1["models"]["lightgbm"]["metrics"]["auroc"] == p2["models"]["lightgbm"]["metrics"]["auroc"]
-    assert p1["models"]["logistic"]["metrics"]["auroc"] == p2["models"]["logistic"]["metrics"]["auroc"]
+    assert (
+        p1["models"]["lightgbm"]["metrics"]["auroc"] == p2["models"]["lightgbm"]["metrics"]["auroc"]
+    )
+    assert (
+        p1["models"]["logistic"]["metrics"]["auroc"] == p2["models"]["logistic"]["metrics"]["auroc"]
+    )
     assert p1["split"]["n_train"] == p2["split"]["n_train"]
     assert p1["split"]["n_test"] == p2["split"]["n_test"]
 
@@ -236,7 +240,7 @@ def _build_toy_clif_with_categories(
     patient_ids = [f"P{i:03d}" for i in range(n_patients)]
     hospitalization_ids = [f"H{i:03d}" for i in range(n_patients)]
     ages = [25 + (i % 50) for i in range(n_patients)]
-    admission_base = datetime(2024, 1, 1, 0, 0, tzinfo=timezone.utc)
+    admission_base = datetime(2024, 1, 1, 0, 0, tzinfo=UTC)
     admission_dttms = [admission_base + timedelta(days=i) for i in range(n_patients)]
     discharge_dttms = [adm + timedelta(days=5) for adm in admission_dttms]
 
@@ -267,7 +271,7 @@ def _build_toy_clif_with_categories(
 
     # Vitals with vital_category and vital_value, two categories per hospitalization
     vital_rows = []
-    for hid, adm, expired in zip(hospitalization_ids, admission_dttms, is_expired):
+    for hid, adm, expired in zip(hospitalization_ids, admission_dttms, is_expired, strict=True):
         for category, base in (("heart_rate", 90.0), ("sbp", 120.0)):
             offset = 15.0 if expired else 0.0
             for hours in range(0, 24, 4):
@@ -285,7 +289,7 @@ def _build_toy_clif_with_categories(
 
     # Labs with lab_category and lab_value_numeric, one category per hospitalization
     lab_rows = []
-    for hid, adm, expired in zip(hospitalization_ids, admission_dttms, is_expired):
+    for hid, adm, expired in zip(hospitalization_ids, admission_dttms, is_expired, strict=True):
         base = 2.5 if expired else 1.0
         for step in range(5):
             lab_rows.append(
@@ -324,24 +328,34 @@ def test_sequence_baseline_command_happy_path(tmp_path: Path) -> None:
         app,
         [
             "sequence-baseline",
-            "--data-root", str(data_root),
-            "--metrics-out", str(metrics_path),
-            "--summary-out", str(summary_path),
-            "--model-out", str(model_path),
-            "--hidden-dim", "8",
-            "--n-layers", "1",
-            "--dropout", "0.0",
-            "--max-epochs", "2",
-            "--patience", "5",
-            "--batch-size", "4",
-            "--device", "cpu",
-            "--seed", "42",
+            "--data-root",
+            str(data_root),
+            "--metrics-out",
+            str(metrics_path),
+            "--summary-out",
+            str(summary_path),
+            "--model-out",
+            str(model_path),
+            "--hidden-dim",
+            "8",
+            "--n-layers",
+            "1",
+            "--dropout",
+            "0.0",
+            "--max-epochs",
+            "2",
+            "--patience",
+            "5",
+            "--batch-size",
+            "4",
+            "--device",
+            "cpu",
+            "--seed",
+            "42",
         ],
     )
 
-    assert result.exit_code == 0, (
-        f"CLI failed:\nstdout={result.stdout}\nexc={result.exception}"
-    )
+    assert result.exit_code == 0, f"CLI failed:\nstdout={result.stdout}\nexc={result.exception}"
     assert metrics_path.exists()
     assert summary_path.exists()
     assert model_path.exists()
@@ -374,9 +388,7 @@ def test_sequence_baseline_command_happy_path(tmp_path: Path) -> None:
         "calibration_intercept",
         "calibration_slope",
     ):
-        assert metric_key in payload["model"]["metrics"], (
-            f"missing metric: {metric_key}"
-        )
+        assert metric_key in payload["model"]["metrics"], f"missing metric: {metric_key}"
     # Config snapshot preserves CLI inputs.
     assert payload["config"]["seed"] == 42
     assert payload["config"]["device_requested"] == "cpu"

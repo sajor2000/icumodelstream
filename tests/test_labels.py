@@ -1,10 +1,11 @@
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import polars as pl
 import pytest
 
 from icumodelstream.io import discover_tables
-from icumodelstream.labels import extract_mortality_labels
+from icumodelstream.labels import extract_los_label, extract_mortality_labels
 
 
 def test_extract_mortality_labels_happy_path(tmp_path: Path) -> None:
@@ -54,9 +55,9 @@ def test_extract_mortality_labels_alternative_column_name(tmp_path: Path) -> Non
 def test_extract_mortality_labels_raises_on_missing_column(tmp_path: Path) -> None:
     """If no discharge candidate column is present, raise ValueError naming candidates and
     actual columns (CLAUDE.md rule 7: fail loudly on missing required data)."""
-    pl.DataFrame(
-        {"hospitalization_id": ["h1"], "patient_id": ["p1"]}
-    ).write_parquet(tmp_path / "hospitalization.parquet")
+    pl.DataFrame({"hospitalization_id": ["h1"], "patient_id": ["p1"]}).write_parquet(
+        tmp_path / "hospitalization.parquet"
+    )
 
     tables = discover_tables(tmp_path)
 
@@ -196,10 +197,6 @@ def test_extract_mortality_labels_schema(tmp_path: Path) -> None:
 # extract_los_label
 # ---------------------------------------------------------------------------
 
-from datetime import datetime, timedelta, timezone
-
-from icumodelstream.labels import extract_los_label
-
 
 def _write_hospitalization_with_los(
     path: Path,
@@ -208,7 +205,7 @@ def _write_hospitalization_with_los(
     discharge_offsets_hours: list[float | None],
 ) -> None:
     """Write hospitalization parquet with admission/discharge datetimes."""
-    anchor = datetime(2024, 1, 1, 0, 0, tzinfo=timezone.utc)
+    anchor = datetime(2024, 1, 1, 0, 0, tzinfo=UTC)
     pl.DataFrame(
         {
             "hospitalization_id": hospitalization_ids,
@@ -273,7 +270,9 @@ def test_extract_los_label_custom_threshold(tmp_path: Path) -> None:
 def test_extract_los_label_negative_threshold_raises(tmp_path: Path) -> None:
     _write_hospitalization_with_los(
         tmp_path / "hospitalization.parquet",
-        hospitalization_ids=["A"], admission_offsets_hours=[0.0], discharge_offsets_hours=[24.0],
+        hospitalization_ids=["A"],
+        admission_offsets_hours=[0.0],
+        discharge_offsets_hours=[24.0],
     )
     tables = discover_tables(tmp_path)
     with pytest.raises(ValueError, match="threshold_hours must be positive"):
@@ -292,7 +291,9 @@ def test_extract_los_label_schema(tmp_path: Path) -> None:
     """Output schema is hospitalization_id + long_los (Int8)."""
     _write_hospitalization_with_los(
         tmp_path / "hospitalization.parquet",
-        hospitalization_ids=["A"], admission_offsets_hours=[0.0], discharge_offsets_hours=[24.0],
+        hospitalization_ids=["A"],
+        admission_offsets_hours=[0.0],
+        discharge_offsets_hours=[24.0],
     )
     tables = discover_tables(tmp_path)
     result = extract_los_label(tables)

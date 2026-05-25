@@ -1,8 +1,8 @@
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
-import pytest
 import polars as pl
+import pytest
 
 from icumodelstream.features import (
     aggregate_numeric_table,
@@ -12,9 +12,9 @@ from icumodelstream.io import discover_tables
 
 
 def test_aggregate_numeric_table_happy_path(tmp_path: Path) -> None:
-    pl.DataFrame(
-        {"hospitalization_id": [1, 1, 2], "value": [10.0, 20.0, 30.0]}
-    ).write_parquet(tmp_path / "vitals.parquet")
+    pl.DataFrame({"hospitalization_id": [1, 1, 2], "value": [10.0, 20.0, 30.0]}).write_parquet(
+        tmp_path / "vitals.parquet"
+    )
 
     tables = discover_tables(tmp_path)
     result = aggregate_numeric_table(tables, "vitals", "vitals")
@@ -27,9 +27,9 @@ def test_aggregate_numeric_table_happy_path(tmp_path: Path) -> None:
 
 
 def test_aggregate_numeric_table_vital_value_column(tmp_path: Path) -> None:
-    pl.DataFrame(
-        {"hospitalization_id": [1], "vital_value": [42.5]}
-    ).write_parquet(tmp_path / "vitals.parquet")
+    pl.DataFrame({"hospitalization_id": [1], "vital_value": [42.5]}).write_parquet(
+        tmp_path / "vitals.parquet"
+    )
 
     tables = discover_tables(tmp_path)
     result = aggregate_numeric_table(tables, "vitals", "vitals")
@@ -39,9 +39,9 @@ def test_aggregate_numeric_table_vital_value_column(tmp_path: Path) -> None:
 
 
 def test_aggregate_numeric_table_lab_value_numeric_column(tmp_path: Path) -> None:
-    pl.DataFrame(
-        {"hospitalization_id": [1], "lab_value_numeric": [99.0]}
-    ).write_parquet(tmp_path / "labs.parquet")
+    pl.DataFrame({"hospitalization_id": [1], "lab_value_numeric": [99.0]}).write_parquet(
+        tmp_path / "labs.parquet"
+    )
 
     tables = discover_tables(tmp_path)
     result = aggregate_numeric_table(tables, "labs", "labs")
@@ -51,9 +51,9 @@ def test_aggregate_numeric_table_lab_value_numeric_column(tmp_path: Path) -> Non
 
 
 def test_aggregate_numeric_table_cohort_filter(tmp_path: Path) -> None:
-    pl.DataFrame(
-        {"hospitalization_id": [1, 2], "value": [5.0, 99.0]}
-    ).write_parquet(tmp_path / "vitals.parquet")
+    pl.DataFrame({"hospitalization_id": [1, 2], "value": [5.0, 99.0]}).write_parquet(
+        tmp_path / "vitals.parquet"
+    )
 
     tables = discover_tables(tmp_path)
     cohort = pl.DataFrame({"hospitalization_id": [1]})
@@ -65,9 +65,7 @@ def test_aggregate_numeric_table_cohort_filter(tmp_path: Path) -> None:
 
 
 def test_aggregate_numeric_table_raises_on_missing_value_col(tmp_path: Path) -> None:
-    pl.DataFrame(
-        {"hospitalization_id": [1]}
-    ).write_parquet(tmp_path / "vitals.parquet")
+    pl.DataFrame({"hospitalization_id": [1]}).write_parquet(tmp_path / "vitals.parquet")
 
     tables = discover_tables(tmp_path)
 
@@ -78,11 +76,13 @@ def test_aggregate_numeric_table_raises_on_missing_value_col(tmp_path: Path) -> 
 def test_aggregate_numeric_table_prefers_numeric_over_legacy_value_col(tmp_path: Path) -> None:
     """When both lab_value (legacy, possibly string) and lab_value_numeric are present,
     the numeric column must win — otherwise CLIF 2.1 labs aggregate to all-null."""
-    pl.DataFrame({
-        "hospitalization_id": [1, 1, 2],
-        "lab_value": ["12.3 mg/dL", "15.1 mg/dL", "5.0 mg/dL"],
-        "lab_value_numeric": [12.3, 15.1, 5.0],
-    }).write_parquet(tmp_path / "labs.parquet")
+    pl.DataFrame(
+        {
+            "hospitalization_id": [1, 1, 2],
+            "lab_value": ["12.3 mg/dL", "15.1 mg/dL", "5.0 mg/dL"],
+            "lab_value_numeric": [12.3, 15.1, 5.0],
+        }
+    ).write_parquet(tmp_path / "labs.parquet")
 
     tables = discover_tables(tmp_path)
     result = aggregate_numeric_table(tables, "labs", "labs").sort("hospitalization_id")
@@ -93,10 +93,12 @@ def test_aggregate_numeric_table_prefers_numeric_over_legacy_value_col(tmp_path:
 
 def test_aggregate_numeric_table_raises_on_unparseable_value_col(tmp_path: Path) -> None:
     """A string-typed value column with non-numeric content must raise, not silently null."""
-    pl.DataFrame({
-        "hospitalization_id": [1, 1, 2, 2],
-        "value": ["120/80", "130/85", "118/78", "125/82"],
-    }).write_parquet(tmp_path / "vitals.parquet")
+    pl.DataFrame(
+        {
+            "hospitalization_id": [1, 1, 2, 2],
+            "value": ["120/80", "130/85", "118/78", "125/82"],
+        }
+    ).write_parquet(tmp_path / "vitals.parquet")
 
     tables = discover_tables(tmp_path)
 
@@ -107,10 +109,12 @@ def test_aggregate_numeric_table_raises_on_unparseable_value_col(tmp_path: Path)
 def test_aggregate_numeric_table_n_uses_raw_row_count(tmp_path: Path) -> None:
     """_n should reflect raw row count, not null-excluding count — otherwise filters like
     `n >= 50` drop hospitalizations whose values mostly survived."""
-    pl.DataFrame({
-        "hospitalization_id": [1, 1, 1, 1],
-        "numeric_value": [10.0, 20.0, None, None],
-    }).write_parquet(tmp_path / "vitals.parquet")
+    pl.DataFrame(
+        {
+            "hospitalization_id": [1, 1, 1, 1],
+            "numeric_value": [10.0, 20.0, None, None],
+        }
+    ).write_parquet(tmp_path / "vitals.parquet")
 
     tables = discover_tables(tmp_path)
     result = aggregate_numeric_table(tables, "vitals", "vitals")
@@ -121,10 +125,12 @@ def test_aggregate_numeric_table_n_uses_raw_row_count(tmp_path: Path) -> None:
 def test_aggregate_numeric_table_raises_on_id_dtype_mismatch(tmp_path: Path) -> None:
     """If cohort.hospitalization_id dtype != source.hospitalization_id dtype, raise with a
     helpful message rather than letting polars raise a cryptic SchemaError."""
-    pl.DataFrame({
-        "hospitalization_id": ["A1", "A2"],
-        "value": [10.0, 20.0],
-    }).write_parquet(tmp_path / "vitals.parquet")
+    pl.DataFrame(
+        {
+            "hospitalization_id": ["A1", "A2"],
+            "value": [10.0, 20.0],
+        }
+    ).write_parquet(tmp_path / "vitals.parquet")
 
     tables = discover_tables(tmp_path)
     cohort = pl.DataFrame({"hospitalization_id": [1, 2]})  # Int64 vs Utf8
@@ -140,9 +146,9 @@ def test_aggregate_numeric_table_cohort_left_join_preserves_missing(tmp_path: Pa
     - _n is coerced to 0 so downstream filters like `n >= 50` work correctly
     - mean/min/max stay null because they're genuinely undefined without data
     """
-    pl.DataFrame(
-        {"hospitalization_id": [1, 2], "value": [10.0, 20.0]}
-    ).write_parquet(tmp_path / "vitals.parquet")
+    pl.DataFrame({"hospitalization_id": [1, 2], "value": [10.0, 20.0]}).write_parquet(
+        tmp_path / "vitals.parquet"
+    )
 
     tables = discover_tables(tmp_path)
     cohort = pl.DataFrame({"hospitalization_id": [1, 2, 3]})
@@ -181,12 +187,12 @@ def _write_vitals_with_dttm(
 
 def test_aggregate_windowed_happy_path(tmp_path: Path) -> None:
     """Rows within [anchor, anchor + 24h) are aggregated; rows outside are dropped."""
-    anchor = datetime(2024, 1, 1, 0, 0, tzinfo=timezone.utc)
+    anchor = datetime(2024, 1, 1, 0, 0, tzinfo=UTC)
     _write_vitals_with_dttm(
         tmp_path / "vitals.parquet",
         hospitalization_ids=[1, 1, 1, 1],
         recorded_dttms=[
-            anchor + timedelta(hours=1),   # in
+            anchor + timedelta(hours=1),  # in
             anchor + timedelta(hours=12),  # in
             anchor + timedelta(hours=23),  # in
             anchor + timedelta(hours=25),  # out
@@ -195,9 +201,9 @@ def test_aggregate_windowed_happy_path(tmp_path: Path) -> None:
     )
 
     tables = discover_tables(tmp_path)
-    anchors = pl.DataFrame(
-        {"hospitalization_id": [1], "anchor_dttm": [anchor]}
-    ).with_columns(pl.col("anchor_dttm").cast(pl.Datetime(time_zone="UTC")))
+    anchors = pl.DataFrame({"hospitalization_id": [1], "anchor_dttm": [anchor]}).with_columns(
+        pl.col("anchor_dttm").cast(pl.Datetime(time_zone="UTC"))
+    )
 
     result = aggregate_numeric_table_windowed(
         tables, "vitals", "vitals", anchors=anchors, window_hours=24
@@ -213,21 +219,21 @@ def test_aggregate_windowed_happy_path(tmp_path: Path) -> None:
 
 def test_aggregate_windowed_excludes_boundary(tmp_path: Path) -> None:
     """Row at exactly anchor + window_hours is excluded (half-open interval)."""
-    anchor = datetime(2024, 1, 1, 0, 0, tzinfo=timezone.utc)
+    anchor = datetime(2024, 1, 1, 0, 0, tzinfo=UTC)
     _write_vitals_with_dttm(
         tmp_path / "vitals.parquet",
         hospitalization_ids=[1, 1],
         recorded_dttms=[
-            anchor + timedelta(hours=0),   # exactly anchor: in
+            anchor + timedelta(hours=0),  # exactly anchor: in
             anchor + timedelta(hours=24),  # exactly anchor + window: out
         ],
         values=[10.0, 99.0],
     )
 
     tables = discover_tables(tmp_path)
-    anchors = pl.DataFrame(
-        {"hospitalization_id": [1], "anchor_dttm": [anchor]}
-    ).with_columns(pl.col("anchor_dttm").cast(pl.Datetime(time_zone="UTC")))
+    anchors = pl.DataFrame({"hospitalization_id": [1], "anchor_dttm": [anchor]}).with_columns(
+        pl.col("anchor_dttm").cast(pl.Datetime(time_zone="UTC"))
+    )
 
     result = aggregate_numeric_table_windowed(
         tables, "vitals", "vitals", anchors=anchors, window_hours=24
@@ -240,7 +246,7 @@ def test_aggregate_windowed_excludes_boundary(tmp_path: Path) -> None:
 
 def test_aggregate_windowed_excludes_pre_anchor(tmp_path: Path) -> None:
     """Row at anchor - 1h is excluded; pre-anchor data must not leak in."""
-    anchor = datetime(2024, 1, 1, 12, 0, tzinfo=timezone.utc)
+    anchor = datetime(2024, 1, 1, 12, 0, tzinfo=UTC)
     _write_vitals_with_dttm(
         tmp_path / "vitals.parquet",
         hospitalization_ids=[1, 1],
@@ -252,9 +258,9 @@ def test_aggregate_windowed_excludes_pre_anchor(tmp_path: Path) -> None:
     )
 
     tables = discover_tables(tmp_path)
-    anchors = pl.DataFrame(
-        {"hospitalization_id": [1], "anchor_dttm": [anchor]}
-    ).with_columns(pl.col("anchor_dttm").cast(pl.Datetime(time_zone="UTC")))
+    anchors = pl.DataFrame({"hospitalization_id": [1], "anchor_dttm": [anchor]}).with_columns(
+        pl.col("anchor_dttm").cast(pl.Datetime(time_zone="UTC"))
+    )
 
     result = aggregate_numeric_table_windowed(
         tables, "vitals", "vitals", anchors=anchors, window_hours=24
@@ -267,14 +273,14 @@ def test_aggregate_windowed_excludes_pre_anchor(tmp_path: Path) -> None:
 
 def test_aggregate_windowed_cohort_left_join_preserves_empty(tmp_path: Path) -> None:
     """Cohort hospitalizations with zero in-window rows get _n=0 and null stats."""
-    anchor = datetime(2024, 1, 1, 0, 0, tzinfo=timezone.utc)
+    anchor = datetime(2024, 1, 1, 0, 0, tzinfo=UTC)
     _write_vitals_with_dttm(
         tmp_path / "vitals.parquet",
         hospitalization_ids=[1, 2, 3],
         recorded_dttms=[
-            anchor + timedelta(hours=1),   # h1: in-window
+            anchor + timedelta(hours=1),  # h1: in-window
             anchor + timedelta(hours=99),  # h2: out-of-window
-            anchor + timedelta(hours=2),   # h3: in-window but not in cohort
+            anchor + timedelta(hours=2),  # h3: in-window but not in cohort
         ],
         values=[10.0, 20.0, 30.0],
     )
@@ -304,7 +310,7 @@ def test_aggregate_windowed_cohort_left_join_preserves_empty(tmp_path: Path) -> 
 
 def test_aggregate_windowed_raises_on_tz_mismatch(tmp_path: Path) -> None:
     """Tz-naive anchors vs tz-aware source datetimes -> ValueError mentioning tz/dtype."""
-    anchor = datetime(2024, 1, 1, 0, 0, tzinfo=timezone.utc)
+    anchor = datetime(2024, 1, 1, 0, 0, tzinfo=UTC)
     _write_vitals_with_dttm(
         tmp_path / "vitals.parquet",
         hospitalization_ids=[1],
@@ -315,9 +321,7 @@ def test_aggregate_windowed_raises_on_tz_mismatch(tmp_path: Path) -> None:
     tables = discover_tables(tmp_path)
     # Naive anchor (no tz_aware cast) -> mismatch.
     naive_anchor = datetime(2024, 1, 1, 0, 0)
-    anchors = pl.DataFrame(
-        {"hospitalization_id": [1], "anchor_dttm": [naive_anchor]}
-    )
+    anchors = pl.DataFrame({"hospitalization_id": [1], "anchor_dttm": [naive_anchor]})
 
     with pytest.raises(ValueError, match="(?i)timezone|tz|dtype"):
         aggregate_numeric_table_windowed(
@@ -327,13 +331,13 @@ def test_aggregate_windowed_raises_on_tz_mismatch(tmp_path: Path) -> None:
 
 def test_aggregate_windowed_raises_on_missing_dttm_col(tmp_path: Path) -> None:
     """Source with no recognized *_dttm column -> ValueError."""
-    pl.DataFrame(
-        {"hospitalization_id": [1], "value": [10.0]}
-    ).write_parquet(tmp_path / "vitals.parquet")
+    pl.DataFrame({"hospitalization_id": [1], "value": [10.0]}).write_parquet(
+        tmp_path / "vitals.parquet"
+    )
 
     tables = discover_tables(tmp_path)
     anchors = pl.DataFrame(
-        {"hospitalization_id": [1], "anchor_dttm": [datetime(2024, 1, 1, tzinfo=timezone.utc)]}
+        {"hospitalization_id": [1], "anchor_dttm": [datetime(2024, 1, 1, tzinfo=UTC)]}
     ).with_columns(pl.col("anchor_dttm").cast(pl.Datetime(time_zone="UTC")))
 
     with pytest.raises(ValueError, match="(?i)datetime|dttm"):
@@ -369,7 +373,7 @@ def test_per_category_aggregation_happy_path(tmp_path: Path) -> None:
     """One column-block per category, each with mean/min/max/n."""
     from icumodelstream.features import aggregate_numeric_table_per_category
 
-    anchor = datetime(2024, 1, 1, 0, 0, tzinfo=timezone.utc)
+    anchor = datetime(2024, 1, 1, 0, 0, tzinfo=UTC)
     _write_vitals_with_category(
         tmp_path / "vitals.parquet",
         hospitalization_ids=[1, 1, 1, 1, 1],
@@ -378,15 +382,18 @@ def test_per_category_aggregation_happy_path(tmp_path: Path) -> None:
         values=[80.0, 90.0, 120.0, 130.0, 98.0],
     )
     tables = discover_tables(tmp_path)
-    anchors = pl.DataFrame(
-        {"hospitalization_id": [1], "anchor_dttm": [anchor]}
-    ).with_columns(pl.col("anchor_dttm").cast(pl.Datetime(time_zone="UTC")))
+    anchors = pl.DataFrame({"hospitalization_id": [1], "anchor_dttm": [anchor]}).with_columns(
+        pl.col("anchor_dttm").cast(pl.Datetime(time_zone="UTC"))
+    )
 
     result = aggregate_numeric_table_per_category(
-        tables, "vitals", "vital_category",
+        tables,
+        "vitals",
+        "vital_category",
         categories=["heart_rate", "sbp", "spo2"],
         prefix_template="vitals_{category}",
-        anchors=anchors, window_hours=24,
+        anchors=anchors,
+        window_hours=24,
     )
 
     assert result.height == 1
@@ -403,7 +410,7 @@ def test_per_category_missing_category_is_zero_n(tmp_path: Path) -> None:
     """A category with no rows in window gets _n=0 and null mean/min/max."""
     from icumodelstream.features import aggregate_numeric_table_per_category
 
-    anchor = datetime(2024, 1, 1, 0, 0, tzinfo=timezone.utc)
+    anchor = datetime(2024, 1, 1, 0, 0, tzinfo=UTC)
     _write_vitals_with_category(
         tmp_path / "vitals.parquet",
         hospitalization_ids=[1, 1],
@@ -412,15 +419,18 @@ def test_per_category_missing_category_is_zero_n(tmp_path: Path) -> None:
         values=[80.0, 90.0],
     )
     tables = discover_tables(tmp_path)
-    anchors = pl.DataFrame(
-        {"hospitalization_id": [1], "anchor_dttm": [anchor]}
-    ).with_columns(pl.col("anchor_dttm").cast(pl.Datetime(time_zone="UTC")))
+    anchors = pl.DataFrame({"hospitalization_id": [1], "anchor_dttm": [anchor]}).with_columns(
+        pl.col("anchor_dttm").cast(pl.Datetime(time_zone="UTC"))
+    )
 
     result = aggregate_numeric_table_per_category(
-        tables, "vitals", "vital_category",
+        tables,
+        "vitals",
+        "vital_category",
         categories=["heart_rate", "lactate"],  # lactate has no rows
         prefix_template="vitals_{category}",
-        anchors=anchors, window_hours=24,
+        anchors=anchors,
+        window_hours=24,
     )
     row = result.row(0, named=True)
     assert row["vitals_heart_rate_n"] == 2
@@ -441,28 +451,31 @@ def test_per_category_respects_window(tmp_path: Path) -> None:
     """Rows outside [anchor, anchor + window_hours) are excluded per category."""
     from icumodelstream.features import aggregate_numeric_table_per_category
 
-    anchor = datetime(2024, 1, 1, 0, 0, tzinfo=timezone.utc)
+    anchor = datetime(2024, 1, 1, 0, 0, tzinfo=UTC)
     _write_vitals_with_category(
         tmp_path / "vitals.parquet",
         hospitalization_ids=[1, 1, 1],
         categories=["heart_rate", "heart_rate", "heart_rate"],
         recorded_dttms=[
-            anchor + timedelta(hours=1),    # in
-            anchor + timedelta(hours=23),   # in
-            anchor + timedelta(hours=25),   # OUT
+            anchor + timedelta(hours=1),  # in
+            anchor + timedelta(hours=23),  # in
+            anchor + timedelta(hours=25),  # OUT
         ],
         values=[80.0, 90.0, 9999.0],
     )
     tables = discover_tables(tmp_path)
-    anchors = pl.DataFrame(
-        {"hospitalization_id": [1], "anchor_dttm": [anchor]}
-    ).with_columns(pl.col("anchor_dttm").cast(pl.Datetime(time_zone="UTC")))
+    anchors = pl.DataFrame({"hospitalization_id": [1], "anchor_dttm": [anchor]}).with_columns(
+        pl.col("anchor_dttm").cast(pl.Datetime(time_zone="UTC"))
+    )
 
     result = aggregate_numeric_table_per_category(
-        tables, "vitals", "vital_category",
+        tables,
+        "vitals",
+        "vital_category",
         categories=["heart_rate"],
         prefix_template="vitals_{category}",
-        anchors=anchors, window_hours=24,
+        anchors=anchors,
+        window_hours=24,
     )
     row = result.row(0, named=True)
     assert row["vitals_heart_rate_n"] == 2  # the +25h row excluded
@@ -478,7 +491,7 @@ def test_respiratory_indicator_happy_path(tmp_path: Path) -> None:
     """One Int8 0/1 column per device_category, indicating presence in window."""
     from icumodelstream.features import respiratory_support_indicator
 
-    anchor = datetime(2024, 1, 1, 0, 0, tzinfo=timezone.utc)
+    anchor = datetime(2024, 1, 1, 0, 0, tzinfo=UTC)
     pl.DataFrame(
         {
             "hospitalization_id": [1, 1, 2],
@@ -500,7 +513,8 @@ def test_respiratory_indicator_happy_path(tmp_path: Path) -> None:
     result = respiratory_support_indicator(
         tables,
         device_categories=["IMV", "Nasal Cannula", "CPAP"],
-        anchors=anchors, window_hours=24,
+        anchors=anchors,
+        window_hours=24,
     ).sort("hospitalization_id")
 
     # Patient 1: had IMV and Nasal Cannula in window
@@ -519,7 +533,7 @@ def test_respiratory_indicator_no_rows_in_window(tmp_path: Path) -> None:
     """A hospitalization with no respiratory_support rows in window gets all-zero flags."""
     from icumodelstream.features import respiratory_support_indicator
 
-    anchor = datetime(2024, 1, 1, 0, 0, tzinfo=timezone.utc)
+    anchor = datetime(2024, 1, 1, 0, 0, tzinfo=UTC)
     pl.DataFrame(
         {
             "hospitalization_id": [1],
@@ -530,12 +544,14 @@ def test_respiratory_indicator_no_rows_in_window(tmp_path: Path) -> None:
         tmp_path / "respiratory_support.parquet"
     )
     tables = discover_tables(tmp_path)
-    anchors = pl.DataFrame(
-        {"hospitalization_id": [1], "anchor_dttm": [anchor]}
-    ).with_columns(pl.col("anchor_dttm").cast(pl.Datetime(time_zone="UTC")))
+    anchors = pl.DataFrame({"hospitalization_id": [1], "anchor_dttm": [anchor]}).with_columns(
+        pl.col("anchor_dttm").cast(pl.Datetime(time_zone="UTC"))
+    )
 
     result = respiratory_support_indicator(
-        tables, device_categories=["IMV"],
-        anchors=anchors, window_hours=24,
+        tables,
+        device_categories=["IMV"],
+        anchors=anchors,
+        window_hours=24,
     )
     assert result.row(0, named=True)["resp_imv"] == 0

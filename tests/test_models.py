@@ -65,9 +65,7 @@ def test_lightgbm_reproducible_with_same_seed() -> None:
     _, r2 = fit_lightgbm_baseline(X_train, y_train, X_test, y_test, seed=42)
 
     assert r1.metrics["auroc"] == pytest.approx(r2.metrics["auroc"], abs=1e-9)
-    assert r1.metrics["brier_score"] == pytest.approx(
-        r2.metrics["brier_score"], abs=1e-9
-    )
+    assert r1.metrics["brier_score"] == pytest.approx(r2.metrics["brier_score"], abs=1e-9)
     assert r1.metrics["prevalence"] == r2.metrics["prevalence"]
     np.testing.assert_allclose(r1.y_pred_proba, r2.y_pred_proba, atol=1e-12)
 
@@ -81,9 +79,7 @@ def test_logistic_reproducible_with_same_seed() -> None:
     _, r2 = fit_logistic_baseline(X_train, y_train, X_test, y_test, seed=42)
 
     assert r1.metrics["auroc"] == pytest.approx(r2.metrics["auroc"], abs=1e-9)
-    assert r1.metrics["brier_score"] == pytest.approx(
-        r2.metrics["brier_score"], abs=1e-9
-    )
+    assert r1.metrics["brier_score"] == pytest.approx(r2.metrics["brier_score"], abs=1e-9)
     assert r1.metrics["prevalence"] == r2.metrics["prevalence"]
     np.testing.assert_allclose(r1.y_pred_proba, r2.y_pred_proba, atol=1e-12)
 

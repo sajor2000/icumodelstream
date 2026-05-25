@@ -9,7 +9,7 @@ Pins:
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import numpy as np
@@ -63,7 +63,7 @@ def _build_toy_clif(
     patient_ids = [f"P{i:03d}" for i in range(n_patients)]
     hospitalization_ids = [f"H{i:03d}" for i in range(n_patients)]
     ages = [25 + (i % 50) for i in range(n_patients)]  # all adult, 25..74
-    admission_base = datetime(2024, 1, 1, 0, 0, tzinfo=timezone.utc)
+    admission_base = datetime(2024, 1, 1, 0, 0, tzinfo=UTC)
     admission_dttms = [admission_base + timedelta(days=i) for i in range(n_patients)]
     discharge_dttms = [adm + timedelta(days=5) for adm in admission_dttms]
 
@@ -102,7 +102,7 @@ def _build_toy_clif(
         vital_ids: list[str] = []
         vital_dttms: list[datetime] = []
         vital_values: list[float] = []
-        for hid, adm, expired in zip(hospitalization_ids, admission_dttms, is_expired):
+        for hid, adm, expired in zip(hospitalization_ids, admission_dttms, is_expired, strict=True):
             # 12 readings spaced 2h apart inside the 24h window.
             base_value = 100.0 if expired else 80.0
             for hours in range(0, 24, 2):
@@ -123,7 +123,7 @@ def _build_toy_clif(
         lab_ids: list[str] = []
         lab_dttms: list[datetime] = []
         lab_values: list[float] = []
-        for hid, adm, expired in zip(hospitalization_ids, admission_dttms, is_expired):
+        for hid, adm, expired in zip(hospitalization_ids, admission_dttms, is_expired, strict=True):
             # 5 readings spaced ~4.8h apart inside the 24h window.
             base_value = 2.5 if expired else 1.0
             for step in range(5):
@@ -136,9 +136,9 @@ def _build_toy_clif(
                 "lab_result_dttm": lab_dttms,
                 "value": lab_values,
             }
-        ).with_columns(
-            pl.col("lab_result_dttm").cast(pl.Datetime(time_zone="UTC"))
-        ).write_parquet(tmp_path / "labs.parquet")
+        ).with_columns(pl.col("lab_result_dttm").cast(pl.Datetime(time_zone="UTC"))).write_parquet(
+            tmp_path / "labs.parquet"
+        )
 
 
 def test_run_baseline_pipeline_happy_path(tmp_path: Path) -> None:
@@ -175,9 +175,9 @@ def test_run_baseline_pipeline_happy_path(tmp_path: Path) -> None:
 def test_get_admission_anchors_returns_renamed_columns(tmp_path: Path) -> None:
     """Standalone test for the public anchors helper."""
     expected_dttms = [
-        datetime(2024, 1, 1, 8, 0, tzinfo=timezone.utc),
-        datetime(2024, 2, 15, 12, 30, tzinfo=timezone.utc),
-        datetime(2024, 3, 20, 23, 45, tzinfo=timezone.utc),
+        datetime(2024, 1, 1, 8, 0, tzinfo=UTC),
+        datetime(2024, 2, 15, 12, 30, tzinfo=UTC),
+        datetime(2024, 3, 20, 23, 45, tzinfo=UTC),
     ]
     pl.DataFrame(
         {
@@ -318,14 +318,14 @@ def _build_sequence_toy_clif(
     patient_ids = [f"P{i:03d}" for i in range(n_patients)]
     hospitalization_ids = [f"H{i:03d}" for i in range(n_patients)]
     ages = [25 + (i % 50) for i in range(n_patients)]
-    admission_base = datetime(2024, 1, 1, 0, 0, tzinfo=timezone.utc)
+    admission_base = datetime(2024, 1, 1, 0, 0, tzinfo=UTC)
     admission_dttms = [admission_base + timedelta(days=i) for i in range(n_patients)]
 
     if variable_los:
         # LOS in hours alternates 6h / 240h (= 10 days) so roughly half cross 72h.
         los_hours = [240 if i % 2 == 0 else 6 for i in range(n_patients)]
         discharge_dttms = [
-            adm + timedelta(hours=h) for adm, h in zip(admission_dttms, los_hours)
+            adm + timedelta(hours=h) for adm, h in zip(admission_dttms, los_hours, strict=True)
         ]
     else:
         discharge_dttms = [adm + timedelta(days=5) for adm in admission_dttms]
@@ -333,9 +333,9 @@ def _build_sequence_toy_clif(
     is_expired = rng.uniform(size=n_patients) < prevalence
     discharge_categories = ["Expired" if flag else "Home" for flag in is_expired]
 
-    pl.DataFrame(
-        {"patient_id": patient_ids, "age": ages}
-    ).write_parquet(tmp_path / "patient.parquet")
+    pl.DataFrame({"patient_id": patient_ids, "age": ages}).write_parquet(
+        tmp_path / "patient.parquet"
+    )
 
     pl.DataFrame(
         {
@@ -365,7 +365,7 @@ def _build_sequence_toy_clif(
     vital_cats: list[str] = []
     vital_dttms: list[datetime] = []
     vital_values: list[float] = []
-    for hid, adm, expired in zip(hospitalization_ids, admission_dttms, is_expired):
+    for hid, adm, expired in zip(hospitalization_ids, admission_dttms, is_expired, strict=True):
         for cat in vital_categories_used:
             base = 100.0 if expired else 80.0
             for hours in range(0, 24, 6):  # 4 readings per category per hospitalization
@@ -380,9 +380,9 @@ def _build_sequence_toy_clif(
             "recorded_dttm": vital_dttms,
             "vital_value": vital_values,
         }
-    ).with_columns(
-        pl.col("recorded_dttm").cast(pl.Datetime(time_zone="UTC"))
-    ).write_parquet(tmp_path / "vitals.parquet")
+    ).with_columns(pl.col("recorded_dttm").cast(pl.Datetime(time_zone="UTC"))).write_parquet(
+        tmp_path / "vitals.parquet"
+    )
 
     # Labs: same shape, with a RICH lab_category and the sequences module's
     # canonical lab column names (lab_result_dttm + lab_value_numeric).
@@ -391,7 +391,7 @@ def _build_sequence_toy_clif(
     lab_cats: list[str] = []
     lab_dttms: list[datetime] = []
     lab_values: list[float] = []
-    for hid, adm, expired in zip(hospitalization_ids, admission_dttms, is_expired):
+    for hid, adm, expired in zip(hospitalization_ids, admission_dttms, is_expired, strict=True):
         for cat in lab_categories_used:
             base = 2.5 if expired else 1.0
             for step in range(3):
@@ -406,9 +406,9 @@ def _build_sequence_toy_clif(
             "lab_result_dttm": lab_dttms,
             "lab_value_numeric": lab_values,
         }
-    ).with_columns(
-        pl.col("lab_result_dttm").cast(pl.Datetime(time_zone="UTC"))
-    ).write_parquet(tmp_path / "labs.parquet")
+    ).with_columns(pl.col("lab_result_dttm").cast(pl.Datetime(time_zone="UTC"))).write_parquet(
+        tmp_path / "labs.parquet"
+    )
 
 
 def test_run_sequence_baseline_pipeline_happy_path(tmp_path: Path) -> None:
@@ -448,9 +448,7 @@ def test_run_sequence_baseline_pipeline_happy_path(tmp_path: Path) -> None:
 
 def test_run_sequence_baseline_pipeline_outcome_los(tmp_path: Path) -> None:
     """outcome='los_gt_7d' dispatches to extract_los_label and records the threshold."""
-    _build_sequence_toy_clif(
-        tmp_path, n_patients=30, prevalence=0.4, seed=0, variable_los=True
-    )
+    _build_sequence_toy_clif(tmp_path, n_patients=30, prevalence=0.4, seed=0, variable_los=True)
     tables = discover_tables(tmp_path)
 
     result = run_sequence_baseline_pipeline(

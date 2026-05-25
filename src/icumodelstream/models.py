@@ -104,8 +104,7 @@ def _validate_xy(
     unique_train = set(np.unique(y_train_np).tolist())
     if not unique_train.issubset({0, 1}):
         raise ValueError(
-            f"y_train must be binary 0/1. Observed unique values: "
-            f"{sorted(unique_train)}."
+            f"y_train must be binary 0/1. Observed unique values: {sorted(unique_train)}."
         )
     if y_train_np.sum() == 0 or y_train_np.sum() == len(y_train_np):
         # Both LightGBM and logistic regression need both classes to fit a
@@ -138,9 +137,7 @@ def _calibration_intercept_slope(
     return float(lr.intercept_[0]), float(lr.coef_[0, 0])
 
 
-def calibration_table(
-    y_true: np.ndarray, y_pred_proba: np.ndarray
-) -> pl.DataFrame:
+def calibration_table(y_true: np.ndarray, y_pred_proba: np.ndarray) -> pl.DataFrame:
     """Bin predictions into fixed deciles (0.0, 0.1, ..., 1.0) and report mean pred vs actual.
 
     Fixed deciles (rather than quantile bins) make calibration tables comparable across
@@ -166,9 +163,7 @@ def calibration_table(
     )
 
 
-def compute_metrics(
-    y_true: np.ndarray, y_pred_proba: np.ndarray
-) -> dict[str, float]:
+def compute_metrics(y_true: np.ndarray, y_pred_proba: np.ndarray) -> dict[str, float]:
     """Discrimination (AUROC, AUPRC), Brier, prevalence, and calibration.
 
     Returns NaN for AUROC/AUPRC when y_true is single-class — discrimination metrics
@@ -178,9 +173,7 @@ def compute_metrics(
     intercept, slope = _calibration_intercept_slope(y_true, y_pred_proba)
     single_class = len(np.unique(y_true)) < 2
     auroc = float("nan") if single_class else float(roc_auc_score(y_true, y_pred_proba))
-    auprc = (
-        float("nan") if single_class else float(average_precision_score(y_true, y_pred_proba))
-    )
+    auprc = float("nan") if single_class else float(average_precision_score(y_true, y_pred_proba))
     return {
         "auroc": auroc,
         "auprc": auprc,
@@ -298,9 +291,7 @@ def save_model(model: Any, path: Path) -> None:
     elif isinstance(model, lgb.Booster):
         booster = model
     else:
-        raise TypeError(
-            f"save_model only supports LightGBM models; got {type(model).__name__}."
-        )
+        raise TypeError(f"save_model only supports LightGBM models; got {type(model).__name__}.")
     booster.save_model(str(path))
 
 

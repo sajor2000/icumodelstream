@@ -112,21 +112,15 @@ def test_prepare_split_tensors_no_patient_leakage() -> None:
     # contract. Recover per-fold patient sets via the indices SplitTensors
     # now exposes and assert every pairwise intersection is empty.
     hid_to_pid = dict(
-        zip(groups["hospitalization_id"].to_list(), groups["patient_id"].to_list())
+        zip(groups["hospitalization_id"].to_list(), groups["patient_id"].to_list(), strict=True)
     )
     all_hids = sequences.hospitalization_ids.tolist()
     train_pids = {hid_to_pid[all_hids[i]] for i in out.train_indices}
     val_pids = {hid_to_pid[all_hids[i]] for i in out.val_indices}
     test_pids = {hid_to_pid[all_hids[i]] for i in out.test_indices}
-    assert train_pids & val_pids == set(), (
-        f"Patient leak train ∩ val: {train_pids & val_pids}"
-    )
-    assert train_pids & test_pids == set(), (
-        f"Patient leak train ∩ test: {train_pids & test_pids}"
-    )
-    assert val_pids & test_pids == set(), (
-        f"Patient leak val ∩ test: {val_pids & test_pids}"
-    )
+    assert train_pids & val_pids == set(), f"Patient leak train ∩ val: {train_pids & val_pids}"
+    assert train_pids & test_pids == set(), f"Patient leak train ∩ test: {train_pids & test_pids}"
+    assert val_pids & test_pids == set(), f"Patient leak val ∩ test: {val_pids & test_pids}"
     assert train_pids | val_pids | test_pids == set(hid_to_pid.values())
 
 
@@ -149,9 +143,8 @@ def test_prepare_split_tensors_reproducible() -> None:
     # Different seed: at least one of the splits must differ. We compare the
     # set of test-fold y values; if shape AND content both match it would mean
     # the seed is being ignored.
-    a_changed = (
-        out_a.X_train.shape != out_c.X_train.shape
-        or not torch.equal(out_a.X_train, out_c.X_train)
+    a_changed = out_a.X_train.shape != out_c.X_train.shape or not torch.equal(
+        out_a.X_train, out_c.X_train
     )
     assert a_changed, "different seed produced identical training tensors"
 
@@ -202,9 +195,7 @@ def _make_separable_split(
 
 def test_train_lstm_loss_decreases_and_auroc_beats_random() -> None:
     """3 epochs on a separable problem -> low train loss, high val AUROC."""
-    X_train, y_train, X_val, y_val = _make_separable_split(
-        n=120, timesteps=8, n_channels=4, seed=0
-    )
+    X_train, y_train, X_val, y_val = _make_separable_split(n=120, timesteps=8, n_channels=4, seed=0)
     # Small architecture so the test runs fast even on CPU; dropout=0 keeps
     # the loss curve monotone-ish for the assertion.
     model = LSTMBaseline(input_dim=4, hidden_dim=16, n_layers=1, dropout=0.0)
@@ -259,9 +250,7 @@ def test_train_lstm_loss_decreases_and_auroc_beats_random() -> None:
 
 def test_train_lstm_reproducible_with_same_seed() -> None:
     """Same seed -> identical best_val_auroc + identical model parameters."""
-    X_train, y_train, X_val, y_val = _make_separable_split(
-        n=120, timesteps=8, n_channels=4, seed=0
-    )
+    X_train, y_train, X_val, y_val = _make_separable_split(n=120, timesteps=8, n_channels=4, seed=0)
 
     # Two independent model+train cycles. Re-seed torch BEFORE constructing
     # each model so weight init is identical; train_lstm re-seeds again
@@ -314,8 +303,7 @@ def test_train_lstm_reproducible_with_same_seed() -> None:
         tensor_b = params_b[name]
         max_diff = (tensor_a - tensor_b).abs().max().item()
         assert max_diff < 1e-5, (
-            f"parameter {name} differs across reproducible runs by "
-            f"max_diff={max_diff:.2e}"
+            f"parameter {name} differs across reproducible runs by max_diff={max_diff:.2e}"
         )
 
 
@@ -450,6 +438,6 @@ def test_fit_sequence_model_reproducible_with_same_seed() -> None:
     # contract. allclose with atol=1e-5 covers any residual float jitter that
     # might appear from move-to-device on different hardware while still
     # catching real RNG-leak bugs.
-    assert np.allclose(
-        result_a.y_pred_proba, result_b.y_pred_proba, atol=1e-5
-    ), "y_pred_proba differs across reproducible runs"
+    assert np.allclose(result_a.y_pred_proba, result_b.y_pred_proba, atol=1e-5), (
+        "y_pred_proba differs across reproducible runs"
+    )

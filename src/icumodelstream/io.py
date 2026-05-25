@@ -45,7 +45,8 @@ def discover_tables(data_root: str | Path, table_glob: str = "*.parquet") -> dic
         key = table_name_from_path(path)
         if key in tables:
             raise ValueError(
-                f"Duplicate table name {key!r}: both {tables[key].path} and {path} resolve to the same key."
+                f"Duplicate table name {key!r}: both {tables[key].path} "
+                f"and {path} resolve to the same key."
             )
         tables[key] = TableRef(name=key, path=path)
     if not tables:

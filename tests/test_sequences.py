@@ -6,7 +6,7 @@ minimum CLIF parquet files needed to exercise one behavior.
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import numpy as np
@@ -31,9 +31,7 @@ def _write_vitals(
             "recorded_dttm": recorded_dttms,
             "vital_value": values,
         }
-    ).with_columns(
-        pl.col("recorded_dttm").cast(pl.Datetime(time_zone="UTC"))
-    ).write_parquet(path)
+    ).with_columns(pl.col("recorded_dttm").cast(pl.Datetime(time_zone="UTC"))).write_parquet(path)
 
 
 def _write_labs(
@@ -50,9 +48,9 @@ def _write_labs(
             "lab_collect_dttm": recorded_dttms,
             "lab_value_numeric": values,
         }
-    ).with_columns(
-        pl.col("lab_collect_dttm").cast(pl.Datetime(time_zone="UTC"))
-    ).write_parquet(path)
+    ).with_columns(pl.col("lab_collect_dttm").cast(pl.Datetime(time_zone="UTC"))).write_parquet(
+        path
+    )
 
 
 def _write_resp(
@@ -67,9 +65,7 @@ def _write_resp(
             "device_category": devices,
             "recorded_dttm": recorded_dttms,
         }
-    ).with_columns(
-        pl.col("recorded_dttm").cast(pl.Datetime(time_zone="UTC"))
-    ).write_parquet(path)
+    ).with_columns(pl.col("recorded_dttm").cast(pl.Datetime(time_zone="UTC"))).write_parquet(path)
 
 
 def _anchors(ids: list, anchor: datetime) -> pl.DataFrame:
@@ -80,7 +76,7 @@ def _anchors(ids: list, anchor: datetime) -> pl.DataFrame:
 
 def test_tensor_shape_happy_path(tmp_path: Path) -> None:
     """Two hospitalizations with vitals + labs in window produce a (2, 24, n_channels) tensor."""
-    anchor = datetime(2024, 1, 1, 0, 0, tzinfo=timezone.utc)
+    anchor = datetime(2024, 1, 1, 0, 0, tzinfo=UTC)
     _write_vitals(
         tmp_path / "vitals.parquet",
         hospitalization_ids=[1, 1, 2],
@@ -130,7 +126,7 @@ def test_tensor_shape_happy_path(tmp_path: Path) -> None:
 
 def test_mask_is_not_forward_filled(tmp_path: Path) -> None:
     """Mask reflects original observations only; forward-fill is for X, not mask."""
-    anchor = datetime(2024, 1, 1, 0, 0, tzinfo=timezone.utc)
+    anchor = datetime(2024, 1, 1, 0, 0, tzinfo=UTC)
     _write_vitals(
         tmp_path / "vitals.parquet",
         hospitalization_ids=[1, 1],
@@ -157,13 +153,13 @@ def test_mask_is_not_forward_filled(tmp_path: Path) -> None:
 
 def test_window_boundary_excludes_exact_endpoint(tmp_path: Path) -> None:
     """A row at exactly anchor + 24h is NOT included (half-open interval)."""
-    anchor = datetime(2024, 1, 1, 0, 0, tzinfo=timezone.utc)
+    anchor = datetime(2024, 1, 1, 0, 0, tzinfo=UTC)
     _write_vitals(
         tmp_path / "vitals.parquet",
         hospitalization_ids=[1, 1],
         categories=["heart_rate", "heart_rate"],
         recorded_dttms=[
-            anchor + timedelta(hours=0),   # in
+            anchor + timedelta(hours=0),  # in
             anchor + timedelta(hours=24),  # out -- exactly on the boundary
         ],
         values=[80.0, 9999.0],
@@ -185,7 +181,7 @@ def test_window_boundary_excludes_exact_endpoint(tmp_path: Path) -> None:
 
 def test_forward_fill_leading_null_to_zero(tmp_path: Path) -> None:
     """Hours before the first observation are filled with 0 (NOT backward-filled)."""
-    anchor = datetime(2024, 1, 1, 0, 0, tzinfo=timezone.utc)
+    anchor = datetime(2024, 1, 1, 0, 0, tzinfo=UTC)
     _write_vitals(
         tmp_path / "vitals.parquet",
         hospitalization_ids=[1],
@@ -212,7 +208,7 @@ def test_forward_fill_leading_null_to_zero(tmp_path: Path) -> None:
 
 def test_respiratory_indicator_no_forward_fill(tmp_path: Path) -> None:
     """Respiratory device flags are 1 only at hours with at least one row; no forward-fill."""
-    anchor = datetime(2024, 1, 1, 0, 0, tzinfo=timezone.utc)
+    anchor = datetime(2024, 1, 1, 0, 0, tzinfo=UTC)
     # vitals must exist for the cohort to have channels; write a dummy row.
     _write_vitals(
         tmp_path / "vitals.parquet",
@@ -254,7 +250,7 @@ def test_channel_ordering_deterministic(tmp_path: Path) -> None:
     Channel layout: all vitals (in given tuple order), then all labs,
     then all assessments, then all respiratory devices.
     """
-    anchor = datetime(2024, 1, 1, 0, 0, tzinfo=timezone.utc)
+    anchor = datetime(2024, 1, 1, 0, 0, tzinfo=UTC)
     _write_vitals(
         tmp_path / "vitals.parquet",
         hospitalization_ids=[1],
@@ -277,7 +273,7 @@ def test_channel_ordering_deterministic(tmp_path: Path) -> None:
     assert out1.numeric_channel_names == out1.channel_names[: len(out1.numeric_channel_names)]
     # Indicator names disjoint from numeric.
     assert set(out1.numeric_channel_names).isdisjoint(
-        set(out1.channel_names[len(out1.numeric_channel_names):])
+        set(out1.channel_names[len(out1.numeric_channel_names) :])
     )
     # Lengths: 7 + 12 + 2 = 21 numeric; +5 resp = 26 total (defaults).
     assert len(out1.numeric_channel_names) == 21
@@ -286,7 +282,7 @@ def test_channel_ordering_deterministic(tmp_path: Path) -> None:
 
 def test_empty_cohort_raises(tmp_path: Path) -> None:
     """Empty cohort -> ValueError."""
-    anchor = datetime(2024, 1, 1, 0, 0, tzinfo=timezone.utc)
+    anchor = datetime(2024, 1, 1, 0, 0, tzinfo=UTC)
     _write_vitals(
         tmp_path / "vitals.parquet",
         hospitalization_ids=[1],
@@ -304,7 +300,7 @@ def test_empty_cohort_raises(tmp_path: Path) -> None:
 
 def test_hospitalization_ids_sorted(tmp_path: Path) -> None:
     """Hospitalizations are sorted in the output regardless of cohort row order."""
-    anchor = datetime(2024, 1, 1, 0, 0, tzinfo=timezone.utc)
+    anchor = datetime(2024, 1, 1, 0, 0, tzinfo=UTC)
     # 3 hospitalizations with string IDs, deliberately unsorted in cohort.
     _write_vitals(
         tmp_path / "vitals.parquet",
@@ -331,7 +327,7 @@ def test_hospitalization_ids_sorted(tmp_path: Path) -> None:
 
 def test_window_hours_must_be_positive(tmp_path: Path) -> None:
     """window_hours <= 0 raises."""
-    anchor = datetime(2024, 1, 1, 0, 0, tzinfo=timezone.utc)
+    anchor = datetime(2024, 1, 1, 0, 0, tzinfo=UTC)
     _write_vitals(
         tmp_path / "vitals.parquet",
         hospitalization_ids=[1],
@@ -349,7 +345,7 @@ def test_window_hours_must_be_positive(tmp_path: Path) -> None:
 
 def test_id_dtype_mismatch_raises(tmp_path: Path) -> None:
     """cohort.hospitalization_id Int vs anchors.hospitalization_id Utf8 -> ValueError."""
-    anchor = datetime(2024, 1, 1, 0, 0, tzinfo=timezone.utc)
+    anchor = datetime(2024, 1, 1, 0, 0, tzinfo=UTC)
     _write_vitals(
         tmp_path / "vitals.parquet",
         hospitalization_ids=[1],

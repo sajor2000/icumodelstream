@@ -401,16 +401,45 @@ def train_lstm(
         n_pos = float((y_train_d == 1).sum().item())
         n_neg = float((y_train_d == 0).sum().item())
         pos_weight_value = n_neg / max(n_pos, 1.0)
-        pos_weight = torch.tensor(
-            pos_weight_value, dtype=torch.float32, device=torch_device
-        )
+        pos_weight = torch.tensor(pos_weight_value, dtype=torch.float32, device=torch_device)
         criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
     else:
         criterion = nn.BCEWithLogitsLoss()
 
-    optimizer = torch.optim.AdamW(
-        model.parameters(), lr=learning_rate, weight_decay=weight_decay
-    )
+    # Keep the baseline optimizer deliberately explicit instead of depending on
+    # torch.optim. Recent PyTorch builds import torch._dynamo during optimizer
+    # construction, which is brittle on some Python 3.11 prerelease environments.
+    # This is a tiny manual AdamW implementation: enough for the Phase-1 LSTM
+    # baseline while avoiding compile/Dynamo import side effects.
+    params = list(model.parameters())
+    exp_avgs = [torch.zeros_like(param) for param in params]
+    exp_avg_sqs = [torch.zeros_like(param) for param in params]
+    beta1 = 0.9
+    beta2 = 0.999
+    eps = 1e-8
+    step_no = 0
+
+    def _manual_step() -> None:
+        nonlocal step_no
+        step_no += 1
+        bias_correction1 = 1.0 - beta1**step_no
+        bias_correction2 = 1.0 - beta2**step_no
+        step_size = learning_rate / bias_correction1
+        with torch.no_grad():
+            for param, exp_avg, exp_avg_sq in zip(params, exp_avgs, exp_avg_sqs, strict=True):
+                if param.grad is None:
+                    continue
+                grad = param.grad
+                if weight_decay:
+                    param.mul_(1.0 - learning_rate * weight_decay)
+                exp_avg.mul_(beta1).add_(grad, alpha=1.0 - beta1)
+                exp_avg_sq.mul_(beta2).addcmul_(grad, grad, value=1.0 - beta2)
+                denom = (exp_avg_sq.sqrt() / bias_correction2**0.5).add_(eps)
+                param.addcdiv_(exp_avg, denom, value=-step_size)
+
+    def _zero_grad() -> None:
+        for param in params:
+            param.grad = None
 
     # Seeded DataLoader: a torch.Generator for shuffle order + a worker_init_fn
     # so that any numpy randomness inside workers is also deterministic.
@@ -454,11 +483,11 @@ def train_lstm(
         train_loss_sum = 0.0
         train_count = 0
         for X_batch, y_batch in train_loader:
-            optimizer.zero_grad()
+            _zero_grad()
             logits = model(X_batch)
             loss = criterion(logits, y_batch)
             loss.backward()
-            optimizer.step()
+            _manual_step()
             bs = y_batch.shape[0]
             train_loss_sum += float(loss.item()) * bs
             train_count += bs
@@ -490,9 +519,7 @@ def train_lstm(
         # ------------------------------------------------------------------
         if val_auroc > best_val_auroc:
             best_val_auroc = val_auroc
-            best_state_dict = {
-                k: v.detach().cpu().clone() for k, v in model.state_dict().items()
-            }
+            best_state_dict = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
             best_epoch = epoch
             epochs_since_improvement = 0
         else:

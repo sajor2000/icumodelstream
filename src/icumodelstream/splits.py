@@ -21,6 +21,8 @@ Both functions wrap scikit-learn:
 
 from __future__ import annotations
 
+import hashlib
+
 import numpy as np
 import polars as pl
 from sklearn.model_selection import GroupKFold, GroupShuffleSplit
@@ -184,3 +186,44 @@ def group_kfold(
         (train_idx, test_idx)
         for train_idx, test_idx in splitter.split(np.zeros(len(X)), groups=groups_np)
     ]
+
+
+def stable_fraction(value: object, seed: str = "icumodelstream-v1") -> float:
+    """Map an identifier to a deterministic fraction in [0, 1)."""
+    digest = hashlib.sha256(f"{seed}:{value}".encode()).hexdigest()
+    return int(digest[:16], 16) / float(16**16)
+
+
+def assign_split(
+    value: object, train: float = 0.70, validation: float = 0.15, seed: str = "icumodelstream-v1"
+) -> str:
+    """Assign a stable train/validation/test split from a patient or hospitalization ID."""
+    if train <= 0 or validation <= 0 or train + validation >= 1:
+        raise ValueError("Expected train > 0, validation > 0, and train + validation < 1.")
+    frac = stable_fraction(value, seed=seed)
+    if frac < train:
+        return "train"
+    if frac < train + validation:
+        return "validation"
+    return "test"
+
+
+def add_stable_split(
+    frame: pl.DataFrame,
+    id_col: str,
+    split_col: str = "split",
+    train: float = 0.70,
+    validation: float = 0.15,
+    seed: str = "icumodelstream-v1",
+) -> pl.DataFrame:
+    """Add a deterministic split column without using row order."""
+    if id_col not in frame.columns:
+        raise ValueError(f"Missing ID column for split assignment: {id_col}")
+    return frame.with_columns(
+        pl.col(id_col)
+        .map_elements(
+            lambda value: assign_split(value, train=train, validation=validation, seed=seed),
+            return_dtype=pl.Utf8,
+        )
+        .alias(split_col)
+    )

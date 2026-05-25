@@ -96,9 +96,7 @@ def _validate_anchors(anchors: pl.DataFrame) -> None:
         )
     anchor_dtype = anchors.schema["anchor_dttm"]
     if not isinstance(anchor_dtype, pl.Datetime):
-        raise ValueError(
-            f"anchors.anchor_dttm must be Datetime, got {anchor_dtype}."
-        )
+        raise ValueError(f"anchors.anchor_dttm must be Datetime, got {anchor_dtype}.")
 
 
 def _per_hour_means(
@@ -130,9 +128,7 @@ def _per_hour_means(
     if "hospitalization_id" not in columns:
         raise ValueError(f"{table_name} must contain hospitalization_id")
     if category_column not in columns:
-        raise ValueError(
-            f"{table_name}.{category_column} not found; observed: {sorted(columns)}."
-        )
+        raise ValueError(f"{table_name}.{category_column} not found; observed: {sorted(columns)}.")
 
     ts_col = _first_existing(columns, DATETIME_CANDIDATES)
     if ts_col is None:
@@ -142,9 +138,7 @@ def _per_hour_means(
         )
     ts_dtype = schema[ts_col]
     if not isinstance(ts_dtype, pl.Datetime):
-        raise ValueError(
-            f"{table_name}.{ts_col} must be Datetime for windowing, got {ts_dtype}."
-        )
+        raise ValueError(f"{table_name}.{ts_col} must be Datetime for windowing, got {ts_dtype}.")
 
     anchor_dtype = anchors.schema["anchor_dttm"]
     if ts_dtype.time_zone != anchor_dtype.time_zone:
@@ -175,9 +169,9 @@ def _per_hour_means(
         .with_columns(
             pl.col(value_col).cast(pl.Float64, strict=False).alias("_value"),
             # Hour index: integer floor of elapsed hours since anchor.
-            (
-                (pl.col(ts_col) - pl.col("anchor_dttm")).dt.total_seconds() // 3600
-            ).cast(pl.Int64).alias("hour"),
+            ((pl.col(ts_col) - pl.col("anchor_dttm")).dt.total_seconds() // 3600)
+            .cast(pl.Int64)
+            .alias("hour"),
         )
         .group_by(["hospitalization_id", "hour", category_column])
         .agg(
@@ -233,9 +227,9 @@ def _per_hour_indicator(
             & pl.col(category_column).is_in(list(categories))
         )
         .with_columns(
-            (
-                (pl.col(ts_col) - pl.col("anchor_dttm")).dt.total_seconds() // 3600
-            ).cast(pl.Int64).alias("hour"),
+            ((pl.col(ts_col) - pl.col("anchor_dttm")).dt.total_seconds() // 3600)
+            .cast(pl.Int64)
+            .alias("hour"),
         )
         .group_by(["hospitalization_id", "hour", category_column])
         .agg(pl.lit(1.0, dtype=pl.Float64).alias("value"))
@@ -330,13 +324,9 @@ def build_sequence_tensors(
     if window_hours <= 0:
         raise ValueError(f"window_hours must be > 0; got {window_hours}.")
     if "hospitalization_id" not in cohort.columns:
-        raise ValueError(
-            f"cohort is missing hospitalization_id; got columns: {cohort.columns}."
-        )
+        raise ValueError(f"cohort is missing hospitalization_id; got columns: {cohort.columns}.")
     if cohort.height == 0:
-        raise ValueError(
-            "Cohort is empty; cannot build sequence tensors."
-        )
+        raise ValueError("Cohort is empty; cannot build sequence tensors.")
     _validate_anchors(anchors)
 
     cohort_id_dtype = cohort.schema["hospitalization_id"]
@@ -348,15 +338,17 @@ def build_sequence_tensors(
         )
 
     # Restrict to cohort hospitalizations that also have an anchor.
-    cohort_with_anchor = cohort.select("hospitalization_id").unique().join(
-        anchors.select("hospitalization_id").unique(),
-        on="hospitalization_id",
-        how="inner",
+    cohort_with_anchor = (
+        cohort.select("hospitalization_id")
+        .unique()
+        .join(
+            anchors.select("hospitalization_id").unique(),
+            on="hospitalization_id",
+            how="inner",
+        )
     )
     if cohort_with_anchor.height == 0:
-        raise ValueError(
-            "No cohort hospitalizations have anchors; cannot build sequence tensors."
-        )
+        raise ValueError("No cohort hospitalizations have anchors; cannot build sequence tensors.")
 
     # Deterministic row order: sort by hospitalization_id (lexicographic for str,
     # ascending for numeric).
@@ -369,12 +361,8 @@ def build_sequence_tensors(
     # ---- Channel layout ----
     vital_channel_names = [f"vitals_{_safe_category_name(c)}" for c in vital_categories]
     lab_channel_names = [f"labs_{_safe_category_name(c)}" for c in lab_categories]
-    assess_channel_names = [
-        f"assess_{_safe_category_name(c)}" for c in assessment_categories
-    ]
-    resp_channel_names = [
-        f"resp_{_safe_category_name(c)}" for c in respiratory_devices
-    ]
+    assess_channel_names = [f"assess_{_safe_category_name(c)}" for c in assessment_categories]
+    resp_channel_names = [f"resp_{_safe_category_name(c)}" for c in respiratory_devices]
 
     numeric_channel_names = vital_channel_names + lab_channel_names + assess_channel_names
     indicator_channel_names = resp_channel_names
@@ -382,7 +370,6 @@ def build_sequence_tensors(
 
     n_numeric = len(numeric_channel_names)
     n_indicator = len(indicator_channel_names)
-    n_channels = n_numeric + n_indicator
     n_hosps = len(hosp_ids)
 
     # Allocate the full output tensor. Numeric region starts as NaN so
@@ -420,9 +407,7 @@ def build_sequence_tensors(
         )
         if long.height == 0:
             continue
-        cat_to_global_idx = {
-            cat: channel_offset + i for i, cat in enumerate(categories)
-        }
+        cat_to_global_idx = {cat: channel_offset + i for i, cat in enumerate(categories)}
         for row in long.iter_rows(named=True):
             hosp = row["hospitalization_id"]
             h = row["hour"]
