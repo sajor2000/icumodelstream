@@ -184,6 +184,7 @@ def fit_lightgbm_baseline(
     X_test: pl.DataFrame,
     y_test: pl.Series,
     seed: int = 42,
+    is_unbalance: bool = False,
 ) -> tuple[Any, BaselineResult]:
     """Fit a LightGBM classifier and return (model, evaluation result).
 
@@ -194,6 +195,15 @@ def fit_lightgbm_baseline(
 
     Hyperparameters are intentionally modest defaults from the plan; tuning
     happens in a later phase, not in this baseline module.
+
+    is_unbalance defaults to False. Setting True up-weights the minority class
+    during training, which inflates predicted probabilities (a -1.94 logit shift
+    was observed on real CLIF-MIMIC adult ICU data, May 2026, lifting Brier from
+    ~0.10 to 0.19 with only a small AUROC gain). Use is_unbalance=True only when
+    AUROC ranking is the only metric that matters and downstream consumers do
+    not interpret the predicted probabilities as actual risk. For calibrated
+    probabilities, leave at False and apply Platt scaling or isotonic regression
+    post-hoc if further calibration is needed.
     """
     _validate_xy(X_train, y_train, X_test, y_test)
 
@@ -207,7 +217,7 @@ def fit_lightgbm_baseline(
         learning_rate=0.05,
         num_leaves=31,
         random_state=seed,
-        is_unbalance=True,
+        is_unbalance=is_unbalance,
         verbose=-1,
     )
     model.fit(X_train_pd, y_train_np)
