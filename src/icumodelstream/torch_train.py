@@ -44,6 +44,12 @@ class SplitTensors:
     n_train_patients: int
     n_val_patients: int
     n_test_patients: int
+    # Aligned-row indices per fold (into the input ``sequences.hospitalization_ids``
+    # array). Exposed so tests can reconstruct per-fold patient sets and assert
+    # pairwise disjointness rather than relying on count-sum proxies.
+    train_indices: np.ndarray
+    val_indices: np.ndarray
+    test_indices: np.ndarray
 
 
 # Single-column outcome candidates checked when ``labels`` lacks an "outcome"
@@ -153,6 +159,17 @@ def prepare_split_tensors(
 
     X_np = sequences.X[seq_idx]  # reorder X to match aligned row order
 
+    # Single-patient cohort cascade guard (review adv-5 + data-leakage).
+    # group_train_test_split short-circuits on a single group rather than
+    # raising, leaving val/test empty and the training loop to crash deep
+    # inside torch with a confusing message. Fail loudly here instead.
+    n_unique_patients = len(set(patient_ids.tolist()))
+    if n_unique_patients < 3:
+        raise ValueError(
+            f"prepare_split_tensors requires at least 3 unique patient_ids for a "
+            f"non-degenerate 70/15/15 split; got {n_unique_patients}."
+        )
+
     # ------------------------------------------------------------------
     # Two-stage patient-aware split.
     #
@@ -222,6 +239,9 @@ def prepare_split_tensors(
         n_train_patients=n_train_patients,
         n_val_patients=n_val_patients,
         n_test_patients=n_test_patients,
+        train_indices=train_idx,
+        val_indices=val_idx,
+        test_indices=test_idx,
     )
 
 
@@ -300,9 +320,10 @@ def train_lstm(
     batch_size: int = 256,
     device: str = "cpu",
     seed: int = 42,
+    use_pos_weight: bool = False,
     verbose: bool = False,
 ) -> TrainingTrace:
-    """Train an LSTMBaseline with BCE-with-logits + pos_weight + AdamW + early stopping.
+    """Train an LSTMBaseline with BCE-with-logits + AdamW + early stopping.
 
     The function MUTATES ``model``: at the end it loads the state dict from
     the epoch with the highest validation AUROC so downstream inference uses
@@ -365,18 +386,27 @@ def train_lstm(
     X_val_d = X_val.to(torch_device)
     y_val_d = y_val.to(torch_device)
 
-    # Class-imbalance handling via pos_weight on BCEWithLogitsLoss. This
-    # reweights the gradient contribution of positive examples WITHOUT
-    # rescaling the predicted probabilities -- crucial for keeping calibration
-    # intact downstream. If y_train has no positives or no negatives the
-    # division blows up; clamp denominator to 1 and let the loss degenerate
-    # gracefully (the training set should never be single-class in practice,
-    # but a defensive guard here is cheap).
-    n_pos = float((y_train_d == 1).sum().item())
-    n_neg = float((y_train_d == 0).sum().item())
-    pos_weight_value = n_neg / max(n_pos, 1.0)
-    pos_weight = torch.tensor(pos_weight_value, dtype=torch.float32, device=torch_device)
-    criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
+    # Default: NO pos_weight. BCE-with-logits + pos_weight is the same
+    # likelihood-reweighting mechanism as LightGBM `is_unbalance=True`, which
+    # in Phase 4 shifted predicted probabilities by -1.94 logits and pushed
+    # Brier from ~0.10 to 0.19 with only a small AUROC gain (commit 8612b04).
+    # Leave probabilities calibrated by default; opt-in only when ranking is
+    # the only consumer of the model output.
+    if max_epochs <= 0:
+        raise ValueError(f"max_epochs must be positive, got {max_epochs}.")
+    if patience <= 0:
+        raise ValueError(f"patience must be positive, got {patience}.")
+
+    if use_pos_weight:
+        n_pos = float((y_train_d == 1).sum().item())
+        n_neg = float((y_train_d == 0).sum().item())
+        pos_weight_value = n_neg / max(n_pos, 1.0)
+        pos_weight = torch.tensor(
+            pos_weight_value, dtype=torch.float32, device=torch_device
+        )
+        criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
+    else:
+        criterion = nn.BCEWithLogitsLoss()
 
     optimizer = torch.optim.AdamW(
         model.parameters(), lr=learning_rate, weight_decay=weight_decay
@@ -533,6 +563,7 @@ def fit_sequence_model(
     batch_size: int = 256,
     device: str | None = None,
     seed: int = 42,
+    use_pos_weight: bool = False,
 ) -> tuple[LSTMBaseline, SequenceResult]:
     """End-to-end: SequenceTensors + labels -> trained LSTM + SequenceResult.
 
@@ -615,6 +646,7 @@ def fit_sequence_model(
         batch_size=batch_size,
         device=resolved_device,
         seed=seed,
+        use_pos_weight=use_pos_weight,
     )
 
     # Test-set inference. The model is on ``resolved_device`` after

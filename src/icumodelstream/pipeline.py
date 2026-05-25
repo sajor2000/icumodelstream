@@ -19,9 +19,16 @@ tables raise ValueError before reaching the model layer.
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import polars as pl
+
+if TYPE_CHECKING:
+    # Type-only import: at runtime ``pipeline`` must not import ``sequences``
+    # / ``torch_models`` / ``torch_train`` because ``sequences`` already
+    # imports the RICH_* constants from this module (cycle). The function
+    # body of ``run_sequence_baseline_pipeline`` imports them lazily.
+    from icumodelstream.torch_models import SequenceResult
 
 from icumodelstream.cohorts import (
     CohortSpec,
@@ -460,4 +467,267 @@ def run_baseline_pipeline(
         logistic=logistic_result,
         config_snapshot=config_snapshot,
         warnings=warnings,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Phase 5 / U4 Sprint 4a: sequence-baseline orchestrator.
+#
+# Same cohort + labels path as ``run_baseline_pipeline``, but builds a
+# (n_hosps, window_hours, n_channels) tensor via ``build_sequence_tensors``
+# and trains the LSTM via ``fit_sequence_model``. The result type mirrors
+# ``BaselinePipelineResult`` field-for-field where possible so downstream
+# JSON / Markdown writers can dispatch on result type without rewriting.
+#
+# CLAUDE.md rule 2 (simplicity first): this is composition of already-tested
+# pieces (build_cohort_with_waterfall -> labels -> build_sequence_tensors ->
+# fit_sequence_model). No new abstraction layer; no model code lives here.
+# CLAUDE.md rule 7 (fail loudly): outcome dispatch + degenerate-label /
+# empty-cohort guards mirror ``run_baseline_pipeline`` exactly.
+# CLAUDE.md rule 8 (no silent patient leakage): the 70/15/15 split happens
+# inside ``prepare_split_tensors`` (called by both our prevalence-recovery
+# step and ``fit_sequence_model``) using ``patient_id`` as the group key.
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class SequencePipelineResult:
+    """End-to-end Phase 5 sequence-baseline result.
+
+    Fields mirror :class:`BaselinePipelineResult` where possible so the CLI's
+    JSON and markdown writers can branch on result type without rewriting.
+    The sequence model uses a 70/15/15 train/val/test split (vs the flat
+    baseline's 80/20 train/test), so the dataclass exposes three counts
+    instead of two.
+    """
+
+    cohort_waterfall: CohortWaterfall
+    n_channels: int
+    channel_names: list[str]
+    n_train: int
+    n_val: int
+    n_test: int
+    n_train_patients: int
+    n_val_patients: int
+    n_test_patients: int
+    train_prevalence: float
+    val_prevalence: float
+    test_prevalence: float
+    lstm: SequenceResult
+    lstm_model: Any
+    config_snapshot: dict[str, Any]
+    warnings: list[str] = field(default_factory=list)
+
+
+def run_sequence_baseline_pipeline(
+    tables: dict[str, TableRef],
+    cohort_spec: CohortSpec,
+    *,
+    window_hours: int = 24,
+    seed: int = 42,
+    outcome: str = "mortality",
+    include_hospice: bool = False,
+    los_threshold_hours: float = 168.0,
+    hidden_dim: int = 128,
+    n_layers: int = 2,
+    dropout: float = 0.3,
+    max_epochs: int = 20,
+    patience: int = 3,
+    learning_rate: float = 1e-3,
+    weight_decay: float = 1e-4,
+    batch_size: int = 256,
+    device: str | None = None,
+) -> SequencePipelineResult:
+    """Run the full Phase 5 sequence baseline: cohort -> labels -> tensors -> LSTM.
+
+    Mirrors :func:`run_baseline_pipeline`'s cohort + label flow but builds an
+    ``(n_hosps, window_hours, n_channels)`` tensor instead of a flat feature
+    matrix and trains an LSTM via :func:`fit_sequence_model`. Always uses the
+    rich channel set (``RICH_VITAL_CATEGORIES`` + ``RICH_LAB_CATEGORIES`` +
+    ``RICH_ASSESSMENT_CATEGORIES`` + ``RICH_RESPIRATORY_DEVICES``); there is
+    no ``feature_set`` knob because the sequence model is the rich-features
+    counterpart by construction.
+
+    Parameters
+    ----------
+    tables:
+        Discovered CLIF parquet tables (from :func:`discover_tables`).
+    cohort_spec:
+        Adult ICU cohort definition.
+    window_hours:
+        Length of the per-hospitalization window in integer hours. Forwarded
+        to :func:`build_sequence_tensors`.
+    seed:
+        Forwarded to :func:`fit_sequence_model` (and internally to
+        :func:`prepare_split_tensors`). Same seed -> reproducible split on CPU.
+    outcome:
+        Either ``"mortality"`` (in-hospital death, default) or ``"los_gt_7d"``
+        (prolonged length-of-stay; threshold from ``los_threshold_hours``).
+    include_hospice:
+        If True, hospitalizations discharged to hospice count as mortality=1.
+        Ignored when ``outcome != "mortality"``.
+    los_threshold_hours:
+        Threshold in hours for the LOS outcome. Default 168.0 (= 7 days).
+        Ignored when ``outcome == "mortality"``.
+    hidden_dim, n_layers, dropout:
+        :class:`LSTMBaseline` architecture hyperparameters.
+    max_epochs, patience, learning_rate, weight_decay, batch_size:
+        :func:`train_lstm` hyperparameters.
+    device:
+        ``"cpu"``, ``"mps"``, ``"cuda"``, or ``None``. ``None`` lets
+        :func:`fit_sequence_model` autodetect the best available device.
+
+    Raises
+    ------
+    ValueError
+        Unknown ``outcome``, empty cohort, no cohort/label intersection,
+        or degenerate (all-zero / all-one) label vector.
+    """
+    # Local imports keep the dependency graph clean: pipeline.py is imported
+    # by sequences.py for the RICH_* constants, so importing sequences /
+    # torch_train at module load would form a cycle. Function-scope imports
+    # break the cycle and are paid only when this entry point is called.
+    from icumodelstream.sequences import build_sequence_tensors
+    from icumodelstream.torch_train import fit_sequence_model, prepare_split_tensors
+
+    if outcome not in {"mortality", "los_gt_7d"}:
+        raise ValueError(
+            f"outcome must be 'mortality' or 'los_gt_7d', got {outcome!r}."
+        )
+
+    config_snapshot: dict[str, Any] = {
+        "cohort_spec": asdict(cohort_spec),
+        "window_hours": window_hours,
+        "seed": seed,
+        "outcome": outcome,
+        "include_hospice": include_hospice,
+        "los_threshold_hours": los_threshold_hours,
+        "hidden_dim": hidden_dim,
+        "n_layers": n_layers,
+        "dropout": dropout,
+        "max_epochs": max_epochs,
+        "patience": patience,
+        "learning_rate": learning_rate,
+        "weight_decay": weight_decay,
+        "batch_size": batch_size,
+        # device=None means "let fit_sequence_model autodetect at fit time";
+        # we record that intent honestly rather than resolving it here.
+        "device": device,
+    }
+
+    cohort, waterfall = build_cohort_with_waterfall(tables, cohort_spec)
+    if cohort.height == 0:
+        raise ValueError(
+            "Cohort is empty after applying CohortSpec filters; cannot run sequence baseline. "
+            f"Waterfall: total={waterfall.total_hospitalizations}, "
+            f"after_age={waterfall.after_age_filter}, "
+            f"after_icu={waterfall.after_icu_filter}."
+        )
+
+    # Same outcome dispatch + rename pattern as run_baseline_pipeline so the
+    # downstream code never branches on outcome name beyond this point.
+    if outcome == "mortality":
+        raw_labels = extract_mortality_labels(tables, include_hospice=include_hospice)
+        labels = raw_labels.rename({"mortality": "outcome"})
+    else:  # outcome == "los_gt_7d"
+        raw_labels = extract_los_label(tables, threshold_hours=los_threshold_hours)
+        labels = raw_labels.rename({"long_los": "outcome"})
+
+    cohort_id_dtype = cohort.schema["hospitalization_id"]
+    label_id_dtype = labels.schema["hospitalization_id"]
+    if cohort_id_dtype != label_id_dtype:
+        raise ValueError(
+            f"hospitalization_id dtype mismatch between cohort ({cohort_id_dtype}) and "
+            f"labels ({label_id_dtype}); cast both sides to a common type before joining."
+        )
+    cohort_with_labels = cohort.join(labels, on="hospitalization_id", how="inner")
+    if cohort_with_labels.height == 0:
+        raise ValueError(
+            "No cohort hospitalizations matched extracted labels; cannot run sequence baseline."
+        )
+
+    y_sum = int(cohort_with_labels["outcome"].sum())
+    y_len = cohort_with_labels.height
+    if y_sum == 0 or y_sum == y_len:
+        raise ValueError(
+            f"Label vector is degenerate (sum={y_sum}, n={y_len}); cannot fit sequence baseline. "
+            "Need at least one example of each class."
+        )
+
+    anchors = get_admission_anchors(tables).join(
+        cohort_with_labels.select("hospitalization_id"),
+        on="hospitalization_id",
+        how="inner",
+    )
+
+    sequences = build_sequence_tensors(
+        tables,
+        cohort_with_labels,
+        anchors,
+        window_hours=window_hours,
+        vital_categories=RICH_VITAL_CATEGORIES,
+        lab_categories=RICH_LAB_CATEGORIES,
+        assessment_categories=RICH_ASSESSMENT_CATEGORIES,
+        respiratory_devices=RICH_RESPIRATORY_DEVICES,
+    )
+
+    labels_for_torch = cohort_with_labels.select("hospitalization_id", "outcome")
+    groups_for_torch = cohort_with_labels.select("hospitalization_id", "patient_id")
+
+    # ---- Recover prevalences / split sizes from a one-off prepare_split_tensors call.
+    # fit_sequence_model calls prepare_split_tensors internally with the same seed,
+    # so this duplicates the split computation. The duplication is intentional and
+    # cheap (just reshape + index): it keeps the split logic in one place
+    # (prepare_split_tensors) without forcing a refactor to expose val/test
+    # prevalences on SequenceResult. The split is deterministic under same seed
+    # so both call sites produce identical folds.
+    split_tensors = prepare_split_tensors(
+        sequences, labels_for_torch, groups_for_torch, seed=seed
+    )
+    n_train = int(split_tensors.X_train.shape[0])
+    n_val = int(split_tensors.X_val.shape[0])
+    n_test = int(split_tensors.X_test.shape[0])
+    train_prevalence = (
+        float(split_tensors.y_train.mean().item()) if n_train > 0 else 0.0
+    )
+    val_prevalence = (
+        float(split_tensors.y_val.mean().item()) if n_val > 0 else 0.0
+    )
+    test_prevalence = (
+        float(split_tensors.y_test.mean().item()) if n_test > 0 else 0.0
+    )
+
+    lstm_model, lstm_result = fit_sequence_model(
+        sequences,
+        labels_for_torch,
+        groups_for_torch,
+        hidden_dim=hidden_dim,
+        n_layers=n_layers,
+        dropout=dropout,
+        max_epochs=max_epochs,
+        patience=patience,
+        learning_rate=learning_rate,
+        weight_decay=weight_decay,
+        batch_size=batch_size,
+        device=device,
+        seed=seed,
+    )
+
+    return SequencePipelineResult(
+        cohort_waterfall=waterfall,
+        n_channels=len(sequences.channel_names),
+        channel_names=list(sequences.channel_names),
+        n_train=n_train,
+        n_val=n_val,
+        n_test=n_test,
+        n_train_patients=split_tensors.n_train_patients,
+        n_val_patients=split_tensors.n_val_patients,
+        n_test_patients=split_tensors.n_test_patients,
+        train_prevalence=train_prevalence,
+        val_prevalence=val_prevalence,
+        test_prevalence=test_prevalence,
+        lstm=lstm_result,
+        lstm_model=lstm_model,
+        config_snapshot=config_snapshot,
+        warnings=[],
     )

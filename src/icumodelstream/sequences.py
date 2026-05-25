@@ -29,6 +29,7 @@ for "do not see the future".
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Any
 
 import numpy as np
 import polars as pl
@@ -361,14 +362,11 @@ def build_sequence_tensors(
     # ascending for numeric).
     cohort_with_anchor = cohort_with_anchor.sort("hospitalization_id")
     hosp_ids = cohort_with_anchor["hospitalization_id"].to_list()
-    hosp_id_to_idx: dict = {hid: i for i, hid in enumerate(hosp_ids)}
+    hosp_id_to_idx: dict[Any, int] = {hid: i for i, hid in enumerate(hosp_ids)}
 
     cohort_ids = cohort_with_anchor.select("hospitalization_id")
 
     # ---- Channel layout ----
-    numeric_channel_names: list[str] = []
-    indicator_channel_names: list[str] = []
-
     vital_channel_names = [f"vitals_{_safe_category_name(c)}" for c in vital_categories]
     lab_channel_names = [f"labs_{_safe_category_name(c)}" for c in lab_categories]
     assess_channel_names = [

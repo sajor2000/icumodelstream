@@ -379,7 +379,10 @@ def test_sequence_baseline_command_happy_path(tmp_path: Path) -> None:
         )
     # Config snapshot preserves CLI inputs.
     assert payload["config"]["seed"] == 42
-    assert payload["config"]["device"] == "cpu"
+    assert payload["config"]["device_requested"] == "cpu"
+    assert payload["config"]["device_resolved"] == "cpu"
+    assert "torch_version" in payload["config"]
+    assert payload["config"]["use_pos_weight"] is False
     assert payload["config"]["hidden_dim"] == 8
     assert payload["config"]["n_layers"] == 1
     assert payload["config"]["max_epochs"] == 2

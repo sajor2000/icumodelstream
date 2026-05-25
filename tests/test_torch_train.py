@@ -108,20 +108,26 @@ def test_prepare_split_tensors_no_patient_leakage() -> None:
         f"test={out.n_test_patients} (sum={total_patients})"
     )
 
-    # Stronger check: reconstruct each fold's patient set from the underlying
-    # data and confirm pairwise disjointness. This guards against the case
-    # where the counts happen to sum right but a patient slipped between folds.
+    # Pairwise patient-set disjointness — the load-bearing CLAUDE.md §8
+    # contract. Recover per-fold patient sets via the indices SplitTensors
+    # now exposes and assert every pairwise intersection is empty.
     hid_to_pid = dict(
         zip(groups["hospitalization_id"].to_list(), groups["patient_id"].to_list())
     )
-    # The split is keyed on aligned-row index; recover patient sets via the
-    # one-to-one hospitalization_id -> patient_id map.
     all_hids = sequences.hospitalization_ids.tolist()
-    # We can't observe indices directly, but per-fold sizes + total = 30 means
-    # every aligned row went somewhere; combined with the count-sum check
-    # above this is sufficient. Keep the explicit assertion below as a
-    # double-check on the patient map sanity.
-    assert len(set(hid_to_pid[h] for h in all_hids)) == 5
+    train_pids = {hid_to_pid[all_hids[i]] for i in out.train_indices}
+    val_pids = {hid_to_pid[all_hids[i]] for i in out.val_indices}
+    test_pids = {hid_to_pid[all_hids[i]] for i in out.test_indices}
+    assert train_pids & val_pids == set(), (
+        f"Patient leak train ∩ val: {train_pids & val_pids}"
+    )
+    assert train_pids & test_pids == set(), (
+        f"Patient leak train ∩ test: {train_pids & test_pids}"
+    )
+    assert val_pids & test_pids == set(), (
+        f"Patient leak val ∩ test: {val_pids & test_pids}"
+    )
+    assert train_pids | val_pids | test_pids == set(hid_to_pid.values())
 
 
 def test_prepare_split_tensors_reproducible() -> None:
@@ -215,6 +221,11 @@ def test_train_lstm_loss_decreases_and_auroc_beats_random() -> None:
     with torch.no_grad():
         initial_loss = float(criterion(model(X_train), y_train).item())
 
+    # use_pos_weight=True pins the original Phase 5 training-loop wiring
+    # (BCE with class-weighted gradients) on the loss-decrease contract.
+    # The default-off path is exercised by other tests (CLI smoke,
+    # fit_sequence_model end-to-end). This test asserts the optimizer steps
+    # are pushing the loss in the right direction at all.
     trace = train_lstm(
         model,
         X_train,
@@ -226,6 +237,7 @@ def test_train_lstm_loss_decreases_and_auroc_beats_random() -> None:
         batch_size=32,
         device="cpu",
         seed=42,
+        use_pos_weight=True,
     )
 
     assert isinstance(trace, TrainingTrace)

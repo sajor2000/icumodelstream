@@ -33,7 +33,7 @@ ml = [
     "lightgbm>=4.3",
 ]
 ml-dl = [
-    "torch>=2.3",
+    "torch>=2.3,<3.0",
 ]
 
 [project.scripts]

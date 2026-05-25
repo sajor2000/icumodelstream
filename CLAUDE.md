@@ -85,8 +85,11 @@ Use the Mac for CLIF parquet inspection, schema validation, QC, cohort construct
 | `src/icumodelstream/labels.py` | Outcome label extraction (in-hospital mortality, hospice-aware). |
 | `src/icumodelstream/splits.py` | Patient-aware train/test split (CLAUDE.md §8). |
 | `src/icumodelstream/models.py` | LightGBM + logistic baselines with calibration check. |
-| `src/icumodelstream/pipeline.py` | End-to-end Phase 4 orchestration (`run_baseline_pipeline`). |
-| `src/icumodelstream/cli.py` | Terminal entry points (`inspect`, `qc`, `cohort`, `baseline`). |
+| `src/icumodelstream/pipeline.py` | End-to-end Phase 4 + Phase 5 orchestration (`run_baseline_pipeline`, `run_sequence_baseline_pipeline`). |
+| `src/icumodelstream/sequences.py` | Per-hospitalization tensor extraction `(n, T, channels)` for sequence models. |
+| `src/icumodelstream/torch_models.py` | LSTMBaseline + SequenceResult dataclass (Transformer stub deferred). |
+| `src/icumodelstream/torch_train.py` | LSTM training loop with patient-aware splits + early stopping. |
+| `src/icumodelstream/cli.py` | Terminal entry points (`inspect`, `qc`, `cohort`, `baseline`, `sequence-baseline`). |
 | `notebooks/` | Marimo notebooks that demonstrate the pipeline against local CLIF parquet. No core logic. |
 | `tests/` | Toy-data unit tests. No real patient data. |
 | `configs/` | Local configs. Keep private configs untracked. |
@@ -121,7 +124,8 @@ Treat all real ICU data as sensitive. MIMIC data are credentialed and must follo
 4. Expand cohort logic for adult ICU stays and expected outcomes.
 5. Add baseline features from vitals, labs, respiratory support, and medications.
 6. Add a LightGBM baseline only after the cohort and labels are locked.
-7. Add GPU training scripts only after local data tests and baseline metrics are reproducible.
+7. Add a synthetic-data-dry-run sequence baseline (LSTM) once LightGBM metrics are stable.
+8. Add GPU training scripts only after CPU/MPS sequence dry-runs and baseline metrics are reproducible.
 
 ## Definition of done for phase 1
 

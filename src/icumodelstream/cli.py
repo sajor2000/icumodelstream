@@ -12,7 +12,7 @@ from rich.console import Console
 from rich.table import Table
 
 from icumodelstream.cohorts import CohortSpec, build_adult_icu_cohort, build_cohort_with_waterfall
-from icumodelstream.io import discover_tables, table_inventory
+from icumodelstream.io import discover_tables, scan_table, table_inventory
 from icumodelstream.labels import extract_los_label, extract_mortality_labels
 from icumodelstream.models import BaselineResult, save_model
 from icumodelstream.pipeline import (
@@ -535,6 +535,7 @@ def _run_sequence_baseline(
     batch_size: int,
     device: str | None,
     seed: int,
+    use_pos_weight: bool = False,
 ) -> tuple[Any, Any, Any, dict[str, Any]]:
     """Run cohort -> labels -> sequences -> LSTM training in one shot.
 
@@ -572,6 +573,41 @@ def _run_sequence_baseline(
         raise typer.BadParameter(
             "No cohort hospitalizations matched extracted labels; cannot run sequence baseline."
         )
+
+    # Informative-censoring guard (review adv-1 + data-leakage finding).
+    # Hospitalizations shorter than the feature window create a mask-shaped
+    # shortcut to outcomes: zeros from hour k onward perfectly identify both
+    # early death (mortality=1) and short stay (long_los=0). Drop them so the
+    # model can't learn the mask-as-label artifact.
+    import polars as _pl
+    hosp_lf = scan_table(tables, "hospitalization")
+    hosp_cols = set(hosp_lf.collect_schema().names())
+    if {"admission_dttm", "discharge_dttm"}.issubset(hosp_cols):
+        long_enough = (
+            hosp_lf.filter(
+                _pl.col("admission_dttm").is_not_null()
+                & _pl.col("discharge_dttm").is_not_null()
+                & (
+                    (
+                        _pl.col("discharge_dttm").cast(_pl.Datetime("us"))
+                        - _pl.col("admission_dttm").cast(_pl.Datetime("us"))
+                    ).dt.total_seconds()
+                    >= window_hours * 3600
+                )
+            )
+            .select("hospitalization_id")
+            .collect()
+        )
+        before = cohort_with_labels.height
+        cohort_with_labels = cohort_with_labels.join(
+            long_enough, on="hospitalization_id", how="inner"
+        )
+        dropped = before - cohort_with_labels.height
+        if cohort_with_labels.height == 0:
+            raise typer.BadParameter(
+                f"After dropping {dropped} hospitalizations with LOS < {window_hours}h "
+                "(informative-censoring guard), cohort is empty."
+            )
 
     anchors = get_admission_anchors(tables).join(
         cohort_with_labels.select("hospitalization_id"),
@@ -627,6 +663,7 @@ def _run_sequence_baseline(
         batch_size=batch_size,
         device=device,
         seed=seed,
+        use_pos_weight=use_pos_weight,
     )
 
     return lstm_model, lstm_result, waterfall, split_meta
@@ -797,8 +834,14 @@ def sequence_baseline(
     learning_rate: float = typer.Option(1e-3, help="AdamW learning rate."),
     weight_decay: float = typer.Option(1e-4, help="AdamW weight decay."),
     device: str = typer.Option(
-        "auto",
-        help="Compute device: 'auto' (cuda > mps > cpu), 'cuda', 'mps', or 'cpu'.",
+        "cpu",
+        help="Compute device: 'cpu' (default — reproducible), 'cuda', 'mps', "
+        "or 'auto' (cuda > mps > cpu; non-deterministic on CUDA/MPS).",
+    ),
+    use_pos_weight: bool = typer.Option(
+        False,
+        help="Apply BCE pos_weight=n_neg/n_pos. Off by default because it "
+        "inflates predicted probabilities (same trap as LightGBM is_unbalance=True).",
     ),
 ) -> None:
     """Run the Phase 5 LSTM sequence baseline and write metrics + state-dict artifacts."""
@@ -827,15 +870,24 @@ def sequence_baseline(
         batch_size=batch_size,
         device=device_arg,
         seed=seed,
+        use_pos_weight=use_pos_weight,
     )
 
     metrics_out.parent.mkdir(parents=True, exist_ok=True)
     summary_out.parent.mkdir(parents=True, exist_ok=True)
     model_out.parent.mkdir(parents=True, exist_ok=True)
 
-    # Move to CPU before saving so the .pt is portable across cuda/mps/cpu loads.
-    torch.save(model.cpu().state_dict(), model_out)
+    # Clone state dict to CPU without mutating the in-memory model. The
+    # earlier `model.cpu().state_dict()` moved the live model off whichever
+    # device it was trained on, which surprised API callers (review adv-10).
+    cpu_state_dict = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+    torch.save(cpu_state_dict, model_out)
 
+    # Record resolved device (post-autodetect) and torch version for
+    # downstream reproducibility audits (review repro-6).
+    resolved_device_for_snapshot = (
+        device_arg if device_arg is not None else "auto-resolved-at-fit-time"
+    )
     config_snapshot = {
         "cohort_spec": asdict(cohort_spec),
         "window_hours": window_hours,
@@ -851,7 +903,10 @@ def sequence_baseline(
         "batch_size": batch_size,
         "learning_rate": learning_rate,
         "weight_decay": weight_decay,
-        "device": device,
+        "use_pos_weight": use_pos_weight,
+        "device_requested": device,
+        "device_resolved": resolved_device_for_snapshot,
+        "torch_version": torch.__version__,
     }
 
     generated_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
