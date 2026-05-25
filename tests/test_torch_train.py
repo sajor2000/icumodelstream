@@ -13,7 +13,13 @@ import pytest
 import torch
 
 from icumodelstream.sequences import SequenceTensors
-from icumodelstream.torch_train import SplitTensors, prepare_split_tensors
+from icumodelstream.torch_models import LSTMBaseline
+from icumodelstream.torch_train import (
+    SplitTensors,
+    TrainingTrace,
+    prepare_split_tensors,
+    train_lstm,
+)
 
 
 def _make_fixture(
@@ -153,3 +159,148 @@ def test_prepare_split_tensors_length_mismatch_raises() -> None:
 
     with pytest.raises(ValueError, match="Alignment failure"):
         prepare_split_tensors(sequences, labels_short, groups, seed=42)
+
+
+# ---------------------------------------------------------------------------
+# Sprint 3b: train_lstm tests.
+#
+# Use a tiny separable problem (one channel carries the label, the other three
+# are noise) so a small LSTM trained for a few epochs converges well below
+# the random-classifier loss and lands above AUROC 0.7. Keeps the suite fast
+# (< 10 s on CPU) while still exercising the full BCE+pos_weight + AdamW +
+# early-stopping path.
+# ---------------------------------------------------------------------------
+
+
+def _make_separable_split(
+    n: int = 120, timesteps: int = 8, n_channels: int = 4, seed: int = 0
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Synthetic train/val with channel 0 carrying signal and the rest noise."""
+    rng = np.random.default_rng(seed)
+    y = rng.integers(0, 2, size=n).astype(np.float32)
+    X = rng.standard_normal((n, timesteps, n_channels)).astype(np.float32) * 0.1
+    # Channel 0 gets a label-dependent offset so the LSTM can read it off
+    # immediately; the other channels are pure noise so we know the signal is
+    # the only thing the model can latch onto.
+    X[:, :, 0] += y[:, None] * 2.0
+    n_train = int(0.7 * n)
+    n_val = int(0.15 * n)
+    return (
+        torch.from_numpy(X[:n_train]),
+        torch.from_numpy(y[:n_train]),
+        torch.from_numpy(X[n_train : n_train + n_val]),
+        torch.from_numpy(y[n_train : n_train + n_val]),
+    )
+
+
+def test_train_lstm_loss_decreases_and_auroc_beats_random() -> None:
+    """3 epochs on a separable problem -> low train loss, high val AUROC."""
+    X_train, y_train, X_val, y_val = _make_separable_split(
+        n=120, timesteps=8, n_channels=4, seed=0
+    )
+    # Small architecture so the test runs fast even on CPU; dropout=0 keeps
+    # the loss curve monotone-ish for the assertion.
+    model = LSTMBaseline(input_dim=4, hidden_dim=16, n_layers=1, dropout=0.0)
+
+    # Measure initial loss BEFORE training. pos_weight inflates the absolute
+    # BCE value (positives get re-weighted up), so an absolute threshold like
+    # `loss < 0.5` is brittle. Asserting "loss went down" is the robust
+    # contract: training MUST reduce loss on a separable problem.
+    n_pos = float((y_train == 1).sum().item())
+    n_neg = float((y_train == 0).sum().item())
+    pos_weight = torch.tensor(n_neg / max(n_pos, 1.0), dtype=torch.float32)
+    criterion = torch.nn.BCEWithLogitsLoss(pos_weight=pos_weight)
+    model.eval()
+    with torch.no_grad():
+        initial_loss = float(criterion(model(X_train), y_train).item())
+
+    trace = train_lstm(
+        model,
+        X_train,
+        y_train,
+        X_val,
+        y_val,
+        max_epochs=3,
+        patience=10,  # > max_epochs so early stopping cannot fire
+        batch_size=32,
+        device="cpu",
+        seed=42,
+    )
+
+    assert isinstance(trace, TrainingTrace)
+    # patience > max_epochs means we always run the full 3 epochs.
+    assert trace.epochs_trained == 3
+    assert trace.early_stopped_at_epoch is None
+    # Loss MUST go down on a separable problem; this is the basic optimizer-
+    # wiring contract (gradients are flowing, AdamW is stepping).
+    assert trace.final_train_loss < initial_loss, (
+        f"final_train_loss={trace.final_train_loss:.4f} did not improve over "
+        f"initial_loss={initial_loss:.4f} -- check optimizer + loss wiring."
+    )
+    # AUROC must beat random by a clear margin on the separable problem.
+    assert trace.best_val_auroc > 0.7, (
+        f"best_val_auroc={trace.best_val_auroc:.4f} -- expected > 0.7 on the "
+        "separable fixture; LSTM is failing to read channel 0."
+    )
+
+
+def test_train_lstm_reproducible_with_same_seed() -> None:
+    """Same seed -> identical best_val_auroc + identical model parameters."""
+    X_train, y_train, X_val, y_val = _make_separable_split(
+        n=120, timesteps=8, n_channels=4, seed=0
+    )
+
+    # Two independent model+train cycles. Re-seed torch BEFORE constructing
+    # each model so weight init is identical; train_lstm re-seeds again
+    # internally to make the optimizer + DataLoader deterministic.
+    torch.manual_seed(7)
+    model_a = LSTMBaseline(input_dim=4, hidden_dim=16, n_layers=1, dropout=0.0)
+    trace_a = train_lstm(
+        model_a,
+        X_train,
+        y_train,
+        X_val,
+        y_val,
+        max_epochs=3,
+        patience=10,
+        batch_size=32,
+        device="cpu",
+        seed=42,
+    )
+
+    torch.manual_seed(7)
+    model_b = LSTMBaseline(input_dim=4, hidden_dim=16, n_layers=1, dropout=0.0)
+    trace_b = train_lstm(
+        model_b,
+        X_train,
+        y_train,
+        X_val,
+        y_val,
+        max_epochs=3,
+        patience=10,
+        batch_size=32,
+        device="cpu",
+        seed=42,
+    )
+
+    # AUROC must match within float tolerance (CPU is bit-exact; loosen the
+    # tolerance only if migrating this test to CUDA, which has known cuDNN
+    # non-determinism).
+    assert abs(trace_a.best_val_auroc - trace_b.best_val_auroc) < 1e-4, (
+        f"AUROC differs across reproducible runs: {trace_a.best_val_auroc} "
+        f"vs {trace_b.best_val_auroc}"
+    )
+
+    # Parameter-level reproducibility: every named tensor must match within
+    # 1e-5. This is the stronger contract -- if any RNG path were missing a
+    # seed, the parameter values would diverge before AUROC ever did.
+    params_a = dict(model_a.named_parameters())
+    params_b = dict(model_b.named_parameters())
+    assert params_a.keys() == params_b.keys()
+    for name, tensor_a in params_a.items():
+        tensor_b = params_b[name]
+        max_diff = (tensor_a - tensor_b).abs().max().item()
+        assert max_diff < 1e-5, (
+            f"parameter {name} differs across reproducible runs by "
+            f"max_diff={max_diff:.2e}"
+        )
