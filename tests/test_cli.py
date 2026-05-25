@@ -667,3 +667,192 @@ def test_sequence_baseline_dca_thresholds_attaches_block(tmp_path: Path) -> None
     assert "decision_curve" in payload
     assert len(payload["decision_curve"]) == 2
     assert "## Decision-curve analysis" in summary_path.read_text()
+
+
+# ---------------------------------------------------------------------------
+# Standalone evaluation commands (evaluate-predictions, decision-curve).
+# These commands consume a saved predictions file and never touch CLIF.
+# ---------------------------------------------------------------------------
+
+
+def _write_predictions_parquet(
+    path: Path,
+    *,
+    n: int = 200,
+    prevalence: float = 0.4,
+    seed: int = 0,
+    include_subgroups: bool = False,
+) -> None:
+    """Build a separable-signal predictions parquet with optional subgroup cols."""
+    rng = np.random.default_rng(seed)
+    signal = rng.standard_normal(n) + (rng.uniform(size=n) < prevalence) * 1.5
+    y_true = (rng.uniform(size=n) < prevalence).astype(np.int64)
+    # Strong sigmoid so probabilities span (0, 1) for high-threshold DCA tests.
+    y_pred_proba = 1.0 / (1.0 + np.exp(-3.0 * signal))
+    cols: dict[str, np.ndarray] = {
+        "y_true": y_true,
+        "y_pred_proba": y_pred_proba,
+    }
+    if include_subgroups:
+        cols["sex"] = np.array(["M" if i % 2 == 0 else "F" for i in range(n)], dtype=object)
+        cols["age_band"] = np.array(
+            ["<40" if i < n // 3 else "40-65" if i < 2 * n // 3 else "65-80"
+             for i in range(n)],
+            dtype=object,
+        )
+    path.parent.mkdir(parents=True, exist_ok=True)
+    pl.DataFrame(cols).write_parquet(path)
+
+
+def test_evaluate_predictions_happy_path_full_block(tmp_path: Path) -> None:
+    """evaluate-predictions with --subgroup-cols + --dca-thresholds produces
+    metrics, calibration, subgroups, and decision_curve in the JSON payload."""
+    pred_path = tmp_path / "predictions.parquet"
+    _write_predictions_parquet(pred_path, n=200, prevalence=0.4, include_subgroups=True)
+
+    metrics_path = tmp_path / "out" / "metrics.json"
+    summary_path = tmp_path / "out" / "summary.md"
+
+    runner = CliRunner()
+    result = runner.invoke(
+        app,
+        [
+            "evaluate-predictions",
+            "--predictions", str(pred_path),
+            "--metrics-out", str(metrics_path),
+            "--summary-out", str(summary_path),
+            "--subgroup-cols", "sex,age_band",
+            "--dca-thresholds", "0.1,0.3,0.5",
+        ],
+    )
+    assert result.exit_code == 0, (
+        f"CLI failed:\nstdout={result.stdout}\nexc={result.exception}"
+    )
+
+    payload = json.loads(metrics_path.read_text())
+    assert payload["n"] == 200
+    assert "metrics" in payload and "auroc" in payload["metrics"]
+    assert "calibration_table" in payload
+    assert "subgroups" in payload
+    assert {row["subgroup_var"] for row in payload["subgroups"]} == {"sex", "age_band"}
+    assert "decision_curve" in payload
+    assert len(payload["decision_curve"]) == 3
+
+    summary = summary_path.read_text()
+    assert "## Metrics" in summary
+    assert "## Calibration (reliability table)" in summary
+    assert "## Subgroup performance" in summary
+    assert "## Decision-curve analysis" in summary
+
+
+def test_evaluate_predictions_missing_required_column_fails_loudly(tmp_path: Path) -> None:
+    """A predictions file without y_pred_proba is rejected with exit code 2."""
+    pred_path = tmp_path / "predictions.parquet"
+    pl.DataFrame({"y_true": [0, 1, 0, 1]}).write_parquet(pred_path)
+
+    runner = CliRunner()
+    result = runner.invoke(
+        app,
+        [
+            "evaluate-predictions",
+            "--predictions", str(pred_path),
+            "--metrics-out", str(tmp_path / "out" / "metrics.json"),
+            "--summary-out", str(tmp_path / "out" / "summary.md"),
+        ],
+    )
+    assert result.exit_code == 2, (
+        f"expected exit code 2 (BadParameter), got {result.exit_code}\n"
+        f"stdout={result.stdout}\nexc={result.exception}"
+    )
+
+
+def test_evaluate_predictions_subgroup_col_not_in_file_fails_loudly(
+    tmp_path: Path,
+) -> None:
+    """A --subgroup-cols value that isn't a column in the predictions file
+    fails with exit code 2 -- subgroups must travel inside the predictions file."""
+    pred_path = tmp_path / "predictions.parquet"
+    _write_predictions_parquet(pred_path, n=50, include_subgroups=False)
+
+    runner = CliRunner()
+    result = runner.invoke(
+        app,
+        [
+            "evaluate-predictions",
+            "--predictions", str(pred_path),
+            "--metrics-out", str(tmp_path / "out" / "metrics.json"),
+            "--summary-out", str(tmp_path / "out" / "summary.md"),
+            "--subgroup-cols", "sex",
+        ],
+    )
+    assert result.exit_code == 2
+
+
+def test_decision_curve_standalone_command_happy_path(tmp_path: Path) -> None:
+    """decision-curve emits a DCA-only JSON + Markdown without metrics or calibration."""
+    pred_path = tmp_path / "predictions.parquet"
+    _write_predictions_parquet(pred_path, n=150, prevalence=0.5)
+
+    out_json = tmp_path / "out" / "dca.json"
+    out_md = tmp_path / "out" / "dca.md"
+
+    runner = CliRunner()
+    result = runner.invoke(
+        app,
+        [
+            "decision-curve",
+            "--predictions", str(pred_path),
+            "--thresholds", "0.1,0.2,0.5",
+            "--out-json", str(out_json),
+            "--out-md", str(out_md),
+        ],
+    )
+    assert result.exit_code == 0, (
+        f"CLI failed:\nstdout={result.stdout}\nexc={result.exception}"
+    )
+
+    payload = json.loads(out_json.read_text())
+    assert payload["n"] == 150
+    assert payload["thresholds"] == [0.1, 0.2, 0.5]
+    assert len(payload["decision_curve"]) == 3
+    # DCA-only: no metrics / calibration / subgroups in this command's payload.
+    assert "metrics" not in payload
+    assert "calibration_table" not in payload
+    assert "subgroups" not in payload
+
+    md = out_md.read_text()
+    assert "# Decision-curve analysis" in md
+    assert "## Decision-curve analysis" in md  # _render_dca_md heading
+
+
+def test_decision_curve_standalone_csv_input(tmp_path: Path) -> None:
+    """decision-curve also accepts CSV input (suffix-sniffed)."""
+    pred_path = tmp_path / "predictions.csv"
+    pred_path.parent.mkdir(parents=True, exist_ok=True)
+    pl.DataFrame(
+        {
+            "y_true": [0, 1, 0, 1, 1, 0, 1, 0],
+            "y_pred_proba": [0.1, 0.9, 0.2, 0.8, 0.7, 0.3, 0.85, 0.15],
+        }
+    ).write_csv(pred_path)
+
+    out_json = tmp_path / "out" / "dca.json"
+    out_md = tmp_path / "out" / "dca.md"
+
+    runner = CliRunner()
+    result = runner.invoke(
+        app,
+        [
+            "decision-curve",
+            "--predictions", str(pred_path),
+            "--thresholds", "0.2,0.5",
+            "--out-json", str(out_json),
+            "--out-md", str(out_md),
+        ],
+    )
+    assert result.exit_code == 0, (
+        f"CLI failed:\nstdout={result.stdout}\nexc={result.exception}"
+    )
+    payload = json.loads(out_json.read_text())
+    assert payload["n"] == 8
+    assert len(payload["decision_curve"]) == 2

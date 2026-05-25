@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+import polars as pl
 import typer
 from rich.console import Console
 from rich.table import Table
@@ -14,7 +15,7 @@ from rich.table import Table
 from icumodelstream.cohorts import CohortSpec, build_adult_icu_cohort, build_cohort_with_waterfall
 from icumodelstream.io import discover_tables, scan_table, table_inventory
 from icumodelstream.labels import extract_los_label, extract_mortality_labels
-from icumodelstream.models import BaselineResult, save_model
+from icumodelstream.models import BaselineResult, calibration_table, compute_metrics, save_model
 from icumodelstream.pipeline import (
     RICH_ASSESSMENT_CATEGORIES,
     RICH_LAB_CATEGORIES,
@@ -1213,6 +1214,276 @@ def sequence_baseline(
     console.print(f"Wrote {metrics_out}")
     console.print(f"Wrote {summary_out}")
     console.print(f"Wrote {model_out}")
+
+
+# ---------------------------------------------------------------------------
+# Standalone evaluation commands. Re-score a saved predictions file without
+# retraining and without touching CLIF parquet -- exists so external runs
+# (checkpoints, ensembles, sensitivity sweeps) can produce the same JSON +
+# Markdown payload shape as the in-pipeline baseline/sequence-baseline.
+# ---------------------------------------------------------------------------
+
+
+_REQUIRED_PRED_COLS = ("y_true", "y_pred_proba")
+
+
+def _load_predictions(path: Path) -> pl.DataFrame:
+    """Load a predictions file (parquet or csv) and validate the required schema.
+
+    Required columns: ``y_true`` (int 0/1) and ``y_pred_proba`` (float in [0, 1]).
+    Optional columns: any subgroup labels (sex, age_band, etc.) the caller
+    passes via ``--subgroup-cols``.
+    """
+    if not path.exists():
+        raise typer.BadParameter(f"--predictions file does not exist: {path}")
+    suffix = path.suffix.lower()
+    if suffix == ".parquet":
+        df = pl.read_parquet(path)
+    elif suffix == ".csv":
+        df = pl.read_csv(path)
+    else:
+        raise typer.BadParameter(
+            f"--predictions must be .parquet or .csv; got {suffix or '(no extension)'}."
+        )
+    missing = [c for c in _REQUIRED_PRED_COLS if c not in df.columns]
+    if missing:
+        raise typer.BadParameter(
+            f"--predictions file is missing required column(s): {missing}. "
+            f"Found: {df.columns}."
+        )
+    if df.height == 0:
+        raise typer.BadParameter(f"--predictions file is empty: {path}")
+    return df
+
+
+def _predictions_subgroup_block(
+    df: pl.DataFrame,
+    subgroup_cols: list[str],
+    y_true: Any,
+    y_pred_proba: Any,
+) -> list[dict[str, Any]]:
+    """Variant of :func:`_compute_subgroup_block` that pulls labels from the
+    predictions DataFrame instead of CLIF tables. Returns ``[]`` when no
+    subgroup columns are requested."""
+    if not subgroup_cols:
+        return []
+    missing = [c for c in subgroup_cols if c not in df.columns]
+    if missing:
+        raise typer.BadParameter(
+            f"--subgroup-cols references column(s) absent from the predictions "
+            f"file: {missing}. Found: {df.columns}."
+        )
+    import numpy as np
+
+    groups = {col: df[col].to_numpy() for col in subgroup_cols}
+    metrics_df = compute_subgroup_metrics(
+        np.asarray(y_true), np.asarray(y_pred_proba), groups
+    )
+    return metrics_df.to_dicts()
+
+
+def _render_evaluate_markdown(
+    *,
+    predictions_path: Path,
+    metrics: dict[str, float],
+    n: int,
+    calib_rows: list[dict[str, Any]],
+    subgroup_rows: list[dict[str, Any]],
+    dca_rows: list[dict[str, Any]],
+    generated_at: str,
+    code_version: str | None,
+) -> str:
+    """Render the Markdown summary written by ``evaluate-predictions``."""
+    lines: list[str] = []
+    lines.append(f"# Prediction-file evaluation --- {generated_at}")
+    lines.append("")
+    lines.append(f"**Predictions:** `{predictions_path.name}` (basename only)")
+    lines.append(f"**Code version:** `{code_version}`")
+    lines.append(f"**n rows:** {n:,}")
+    lines.append("")
+    lines.append("## Metrics")
+    lines.append("")
+    lines.append("| AUROC | AUPRC | Brier | Prevalence | Calib intercept | Calib slope |")
+    lines.append("|---|---|---|---|---|---|")
+    lines.append(
+        "| {auroc} | {auprc} | {brier} | {prev} | {intercept} | {slope} |".format(
+            auroc=_format_metric(metrics.get("auroc")),
+            auprc=_format_metric(metrics.get("auprc")),
+            brier=_format_metric(metrics.get("brier_score")),
+            prev=_format_metric(metrics.get("prevalence")),
+            intercept=_format_metric(metrics.get("calibration_intercept")),
+            slope=_format_metric(metrics.get("calibration_slope")),
+        )
+    )
+    lines.append("")
+    lines.append("## Calibration (reliability table)")
+    lines.append("")
+    lines.append(_render_calibration_md("Predictions", calib_rows))
+    lines.append("")
+    body = "\n".join(lines) + "\n"
+    return body + _render_subgroup_md(subgroup_rows) + _render_dca_md(dca_rows)
+
+
+@app.command(name="evaluate-predictions")
+def evaluate_predictions(
+    predictions: Path = typer.Option(
+        ..., help="Path to a predictions parquet or csv with y_true + y_pred_proba columns."
+    ),
+    metrics_out: Path = typer.Option(
+        Path("reports/predictions_metrics.json"), help="Output JSON path."
+    ),
+    summary_out: Path = typer.Option(
+        Path("reports/predictions_summary.md"), help="Output Markdown summary path."
+    ),
+    subgroup_cols: str = typer.Option(
+        "",
+        help="Comma-separated subgroup column list. Each must be present as a "
+        "column in the predictions file. Empty (default) skips subgroup analysis.",
+    ),
+    dca_thresholds: str = typer.Option(
+        "",
+        help="Comma-separated probability thresholds for decision-curve analysis. "
+        "Empty (default) skips analysis. Example: 0.05,0.10,0.20,0.50",
+    ),
+) -> None:
+    """Re-score a saved predictions file (metrics + calibration + subgroups + DCA).
+
+    Reads y_true and y_pred_proba from the file, computes the same metrics
+    block the in-pipeline baseline emits, and writes JSON + Markdown reports.
+    No CLIF data root is required.
+    """
+    import numpy as np
+
+    df = _load_predictions(predictions)
+    y_true = df["y_true"].to_numpy()
+    y_pred_proba = df["y_pred_proba"].to_numpy()
+    # The pipeline-side metrics functions expect numeric arrays; cast defensively
+    # so a polars int8/uint8 column doesn't silently surprise sklearn.
+    y_true = np.asarray(y_true, dtype=np.int64)
+    y_pred_proba = np.asarray(y_pred_proba, dtype=np.float64)
+
+    parsed_subgroups = [c.strip() for c in subgroup_cols.split(",") if c.strip()]
+    parsed_dca_thresholds = _parse_dca_thresholds(dca_thresholds)
+
+    metrics = compute_metrics(y_true, y_pred_proba)
+    calib_rows = calibration_table(y_true, y_pred_proba).to_dicts()
+    subgroup_rows = _predictions_subgroup_block(
+        df, parsed_subgroups, y_true, y_pred_proba
+    )
+    dca_rows = _compute_dca_block(y_true, y_pred_proba, parsed_dca_thresholds)
+
+    generated_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    code_version = _git_head_sha()
+
+    payload: dict[str, Any] = {
+        "predictions_basename": predictions.name,
+        "n": int(df.height),
+        "metrics": metrics,
+        "calibration_table": calib_rows,
+        "generated_at": generated_at,
+        "code_version": code_version,
+    }
+    if subgroup_rows:
+        payload["subgroups"] = subgroup_rows
+    if dca_rows:
+        payload["decision_curve"] = dca_rows
+
+    metrics_out.parent.mkdir(parents=True, exist_ok=True)
+    summary_out.parent.mkdir(parents=True, exist_ok=True)
+    metrics_out.write_text(
+        json.dumps(_nan_to_none(payload), indent=2, sort_keys=False, allow_nan=False)
+    )
+    summary_out.write_text(
+        _render_evaluate_markdown(
+            predictions_path=predictions,
+            metrics=metrics,
+            n=int(df.height),
+            calib_rows=calib_rows,
+            subgroup_rows=subgroup_rows,
+            dca_rows=dca_rows,
+            generated_at=generated_at,
+            code_version=code_version,
+        )
+    )
+
+    console.print("=== evaluate-predictions complete ===")
+    console.print(f"n rows:    {df.height:,}")
+    console.print(
+        "Metrics    "
+        f"AUROC {_format_metric(metrics.get('auroc'))}  "
+        f"AUPRC {_format_metric(metrics.get('auprc'))}  "
+        f"Brier {_format_metric(metrics.get('brier_score'))}  "
+        f"CalibSlope {_format_metric(metrics.get('calibration_slope'))}"
+    )
+    console.print(f"Wrote {metrics_out}")
+    console.print(f"Wrote {summary_out}")
+
+
+@app.command(name="decision-curve")
+def decision_curve(
+    predictions: Path = typer.Option(
+        ..., help="Path to a predictions parquet or csv with y_true + y_pred_proba columns."
+    ),
+    thresholds: str = typer.Option(
+        ...,
+        help="Comma-separated probability thresholds in (0, 1). Example: 0.05,0.10,0.20,0.50",
+    ),
+    out_json: Path = typer.Option(
+        Path("reports/decision_curve.json"), help="Output JSON path."
+    ),
+    out_md: Path = typer.Option(
+        Path("reports/decision_curve.md"), help="Output Markdown summary path."
+    ),
+) -> None:
+    """DCA-only convenience wrapper over a predictions file.
+
+    Same loader as ``evaluate-predictions`` (parquet or csv with y_true +
+    y_pred_proba); emits a focused JSON + Markdown payload containing just
+    the decision-curve table. Skip ``evaluate-predictions`` when calibration
+    and subgroups aren't needed -- net benefit only.
+    """
+    import numpy as np
+
+    parsed_thresholds = _parse_dca_thresholds(thresholds)
+    if not parsed_thresholds:
+        raise typer.BadParameter("--thresholds is required and must not be empty.")
+
+    df = _load_predictions(predictions)
+    y_true = np.asarray(df["y_true"].to_numpy(), dtype=np.int64)
+    y_pred_proba = np.asarray(df["y_pred_proba"].to_numpy(), dtype=np.float64)
+
+    dca_rows = _compute_dca_block(y_true, y_pred_proba, parsed_thresholds)
+
+    generated_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    code_version = _git_head_sha()
+    payload: dict[str, Any] = {
+        "predictions_basename": predictions.name,
+        "n": int(df.height),
+        "thresholds": parsed_thresholds,
+        "decision_curve": dca_rows,
+        "generated_at": generated_at,
+        "code_version": code_version,
+    }
+
+    out_json.parent.mkdir(parents=True, exist_ok=True)
+    out_md.parent.mkdir(parents=True, exist_ok=True)
+    out_json.write_text(
+        json.dumps(_nan_to_none(payload), indent=2, sort_keys=False, allow_nan=False)
+    )
+    md_lines = [
+        f"# Decision-curve analysis --- {generated_at}",
+        "",
+        f"**Predictions:** `{predictions.name}` (basename only)",
+        f"**Code version:** `{code_version}`",
+        f"**n rows:** {df.height:,}",
+    ]
+    out_md.write_text("\n".join(md_lines) + "\n" + _render_dca_md(dca_rows))
+
+    console.print("=== decision-curve complete ===")
+    console.print(f"n rows:    {df.height:,}")
+    console.print(f"Thresholds: {parsed_thresholds}")
+    console.print(f"Wrote {out_json}")
+    console.print(f"Wrote {out_md}")
 
 
 if __name__ == "__main__":
