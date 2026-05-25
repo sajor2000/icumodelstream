@@ -507,3 +507,163 @@ def test_baseline_subgroup_cols_unknown_value_fails_loudly(tmp_path: Path) -> No
         f"expected exit code 2 (BadParameter), got {result.exit_code}\n"
         f"stdout={result.stdout}\nexc={result.exception}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Decision-curve analysis (U2 of DCA plan). Mirrors the subgroup-cols tests
+# above: happy path attaches a block, default keeps payload unchanged,
+# invalid input fails loudly. Plus one sequence-baseline smoke.
+# ---------------------------------------------------------------------------
+
+
+def test_baseline_dca_thresholds_happy_path(tmp_path: Path) -> None:
+    """--dca-thresholds 0.1,0.2,0.5 attaches a 3-row decision_curve block to
+    JSON and a `## Decision-curve analysis` section to the Markdown."""
+    data_root = tmp_path / "data"
+    data_root.mkdir()
+    _build_toy_clif_with_categories(data_root, n_patients=80, prevalence=0.4, seed=1)
+
+    metrics_path = tmp_path / "out" / "metrics.json"
+    summary_path = tmp_path / "out" / "summary.md"
+
+    runner = CliRunner()
+    result = runner.invoke(
+        app,
+        [
+            "baseline",
+            "--data-root", str(data_root),
+            "--metrics-out", str(metrics_path),
+            "--summary-out", str(summary_path),
+            "--seed", "0",
+            "--dca-thresholds", "0.1,0.2,0.5",
+        ],
+    )
+    assert result.exit_code == 0, (
+        f"CLI failed:\nstdout={result.stdout}\nexc={result.exception}"
+    )
+
+    payload = json.loads(metrics_path.read_text())
+    assert "decision_curve" in payload, "decision_curve block missing from payload"
+    rows = payload["decision_curve"]
+    assert len(rows) == 3
+    expected_fields = {
+        "threshold",
+        "n",
+        "prevalence",
+        "n_positive_pred",
+        "n_true_positive",
+        "n_false_positive",
+        "net_benefit",
+        "net_benefit_treat_all",
+        "net_benefit_treat_none",
+    }
+    for row in rows:
+        assert expected_fields.issubset(row.keys()), (
+            f"missing DCA fields: {expected_fields - set(row.keys())}"
+        )
+
+    summary = summary_path.read_text()
+    assert "## Decision-curve analysis" in summary
+    # One Markdown row per threshold, plus the header + separator.
+    # Quick proxy: each threshold value renders into the section.
+    for pt_str in ("0.100", "0.200", "0.500"):
+        assert pt_str in summary, f"threshold {pt_str} missing from DCA section"
+
+
+def test_baseline_dca_thresholds_default_empty_omits_key(tmp_path: Path) -> None:
+    """Default (no --dca-thresholds) leaves the payload free of a `decision_curve`
+    key and the summary free of the DCA section -- backwards compatibility."""
+    data_root = tmp_path / "data"
+    data_root.mkdir()
+    _build_toy_clif_with_categories(data_root, n_patients=60, prevalence=0.5, seed=0)
+
+    metrics_path = tmp_path / "out" / "metrics.json"
+    summary_path = tmp_path / "out" / "summary.md"
+
+    runner = CliRunner()
+    result = runner.invoke(
+        app,
+        [
+            "baseline",
+            "--data-root", str(data_root),
+            "--metrics-out", str(metrics_path),
+            "--summary-out", str(summary_path),
+            "--seed", "0",
+        ],
+    )
+    assert result.exit_code == 0, (
+        f"CLI failed:\nstdout={result.stdout}\nexc={result.exception}"
+    )
+    payload = json.loads(metrics_path.read_text())
+    assert "decision_curve" not in payload
+    assert "## Decision-curve analysis" not in summary_path.read_text()
+
+
+def test_baseline_dca_thresholds_invalid_value_fails_loudly(tmp_path: Path) -> None:
+    """Out-of-range threshold (1.5) fails with typer BadParameter (exit code 2)."""
+    data_root = tmp_path / "data"
+    data_root.mkdir()
+    _build_toy_clif_with_categories(data_root, n_patients=40, prevalence=0.5, seed=0)
+
+    runner = CliRunner()
+    result = runner.invoke(
+        app,
+        [
+            "baseline",
+            "--data-root", str(data_root),
+            "--metrics-out", str(tmp_path / "out" / "metrics.json"),
+            "--summary-out", str(tmp_path / "out" / "summary.md"),
+            "--seed", "0",
+            "--dca-thresholds", "0.5,1.5",
+        ],
+    )
+    assert result.exit_code == 2, (
+        f"expected exit code 2 (BadParameter), got {result.exit_code}\n"
+        f"stdout={result.stdout}\nexc={result.exception}"
+    )
+
+
+def test_sequence_baseline_dca_thresholds_attaches_block(tmp_path: Path) -> None:
+    """Parallel sequence-baseline smoke: --dca-thresholds also attaches a
+    decision_curve block to the LSTM payload."""
+    import torch
+
+    # Same macOS torch-threads guard as the sequence-baseline happy path.
+    torch.set_num_threads(1)
+
+    data_root = tmp_path / "data"
+    data_root.mkdir()
+    _build_toy_clif_with_categories(data_root, n_patients=60, prevalence=0.5, seed=0)
+
+    metrics_path = tmp_path / "out" / "sequence_metrics.json"
+    summary_path = tmp_path / "out" / "sequence_summary.md"
+    model_path = tmp_path / "out" / "sequence_model.pt"
+
+    runner = CliRunner()
+    result = runner.invoke(
+        app,
+        [
+            "sequence-baseline",
+            "--data-root", str(data_root),
+            "--metrics-out", str(metrics_path),
+            "--summary-out", str(summary_path),
+            "--model-out", str(model_path),
+            "--hidden-dim", "8",
+            "--n-layers", "1",
+            "--dropout", "0.0",
+            "--max-epochs", "2",
+            "--patience", "5",
+            "--batch-size", "4",
+            "--device", "cpu",
+            "--seed", "42",
+            "--dca-thresholds", "0.1,0.5",
+        ],
+    )
+    assert result.exit_code == 0, (
+        f"CLI failed:\nstdout={result.stdout}\nexc={result.exception}"
+    )
+
+    payload = json.loads(metrics_path.read_text())
+    assert "decision_curve" in payload
+    assert len(payload["decision_curve"]) == 2
+    assert "## Decision-curve analysis" in summary_path.read_text()

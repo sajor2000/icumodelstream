@@ -26,6 +26,7 @@ from icumodelstream.pipeline import (
     get_admission_anchors,
     run_baseline_pipeline,
 )
+from icumodelstream.decision_curves import compute_decision_curve
 from icumodelstream.subgroups import compute_subgroup_metrics
 from icumodelstream.qc import build_qc_report, write_qc_report
 from icumodelstream.schema import validate_table_contracts, validation_results_to_frame
@@ -203,6 +204,83 @@ def _compute_subgroup_block(
         np.asarray(y_true), np.asarray(y_pred_proba), groups
     )
     return metrics_df.to_dicts()
+
+
+def _parse_dca_thresholds(raw: str) -> list[float]:
+    """Parse the comma-separated --dca-thresholds flag value.
+
+    Empty / whitespace-only input returns ``[]`` (analysis skipped). Each
+    parsed value must be a float in the open interval ``(0, 1)``; non-numeric
+    input or out-of-range values raise ``typer.BadParameter`` so the CLI
+    fails loudly at exit code 2 (mirrors :func:`_parse_subgroup_cols`).
+    """
+    if not raw or not raw.strip():
+        return []
+    raw_tokens = [t.strip() for t in raw.split(",") if t.strip()]
+    parsed: list[float] = []
+    for token in raw_tokens:
+        try:
+            value = float(token)
+        except ValueError as exc:
+            raise typer.BadParameter(
+                f"--dca-thresholds value {token!r} is not a number."
+            ) from exc
+        if not (0.0 < value < 1.0):
+            raise typer.BadParameter(
+                f"--dca-thresholds value {value!r} must be in the open interval (0, 1)."
+            )
+        parsed.append(value)
+    return parsed
+
+
+def _compute_dca_block(
+    y_true: Any,
+    y_pred_proba: Any,
+    thresholds: list[float],
+) -> list[dict[str, Any]]:
+    """Compute per-threshold net benefit, return tidy dict list.
+
+    Returns ``[]`` when ``thresholds`` is empty so callers can attach the
+    block unconditionally. No CLIF coupling -- DCA reads only the per-row
+    predictions and labels already in :class:`BaselineResult` /
+    :class:`SequenceResult`.
+    """
+    if not thresholds:
+        return []
+    import numpy as np  # local import to keep `inspect` / `qc` / `cohort` numpy-free
+
+    curve_df = compute_decision_curve(
+        np.asarray(y_true), np.asarray(y_pred_proba), thresholds
+    )
+    return curve_df.to_dicts()
+
+
+def _render_dca_md(rows: list[dict[str, Any]]) -> str:
+    """Render the decision-curve dict-list as a Markdown section.
+
+    Empty input returns "" so callers can append unconditionally.
+    """
+    if not rows:
+        return ""
+    lines = [
+        "",
+        "## Decision-curve analysis",
+        "",
+        "| Threshold | Net benefit | NB (treat all) | NB (treat none) | n+ pred | TP | FP |",
+        "|---|---|---|---|---|---|---|",
+    ]
+    for r in rows:
+        lines.append(
+            f"| {_format_metric(r['threshold'])} | "
+            f"{_format_metric(r['net_benefit'])} | "
+            f"{_format_metric(r['net_benefit_treat_all'])} | "
+            f"{_format_metric(r['net_benefit_treat_none'])} | "
+            f"{r['n_positive_pred']:,} | "
+            f"{r['n_true_positive']:,} | "
+            f"{r['n_false_positive']:,} |"
+        )
+    lines.append("")
+    return "\n".join(lines)
 
 
 def _render_subgroup_md(rows: list[dict[str, Any]]) -> str:
@@ -546,6 +624,11 @@ def baseline(
         "metrics. Empty (default) skips analysis. Supported: "
         "sex, race_category, ethnicity, age_band, icu_type.",
     ),
+    dca_thresholds: str = typer.Option(
+        "",
+        help="Comma-separated probability thresholds for decision-curve analysis. "
+        "Empty (default) skips analysis. Example: 0.05,0.10,0.20,0.50",
+    ),
 ) -> None:
     """Run the Phase 4 LightGBM + logistic baseline and write metrics + model artifacts."""
     resolved_root = _resolve_data_root(data_root)
@@ -553,6 +636,7 @@ def baseline(
 
     cohort_spec = CohortSpec(min_age=min_age, require_icu_location=require_icu_location)
     parsed_subgroups = _parse_subgroup_cols(subgroup_cols)
+    parsed_dca_thresholds = _parse_dca_thresholds(dca_thresholds)
     result = run_baseline_pipeline(
         tables,
         cohort_spec,
@@ -584,6 +668,16 @@ def baseline(
     if subgroup_rows:
         payload["subgroups"] = subgroup_rows
 
+    # Decision-curve analysis (TRIPOD+AI clinical utility) — same per-row
+    # predictions as the subgroup block (LightGBM test set).
+    dca_rows = _compute_dca_block(
+        result.lightgbm.y_true,
+        result.lightgbm.y_pred_proba,
+        parsed_dca_thresholds,
+    )
+    if dca_rows:
+        payload["decision_curve"] = dca_rows
+
     metrics_out.parent.mkdir(parents=True, exist_ok=True)
     summary_out.parent.mkdir(parents=True, exist_ok=True)
     model_out.parent.mkdir(parents=True, exist_ok=True)
@@ -596,6 +690,7 @@ def baseline(
             payload=payload, metrics_out=metrics_out, model_out=model_out
         )
         + _render_subgroup_md(subgroup_rows)
+        + _render_dca_md(dca_rows)
     )
     save_model(result.lightgbm_model, model_out)
 
@@ -957,6 +1052,11 @@ def sequence_baseline(
         "metrics. Empty (default) skips analysis. Supported: "
         "sex, race_category, ethnicity, age_band, icu_type.",
     ),
+    dca_thresholds: str = typer.Option(
+        "",
+        help="Comma-separated probability thresholds for decision-curve analysis. "
+        "Empty (default) skips analysis. Example: 0.05,0.10,0.20,0.50",
+    ),
 ) -> None:
     """Run the Phase 5 LSTM sequence baseline and write metrics + state-dict artifacts."""
     import platform
@@ -1055,6 +1155,17 @@ def sequence_baseline(
     if subgroup_rows:
         payload["subgroups"] = subgroup_rows
 
+    # Decision-curve analysis (TRIPOD+AI clinical utility) — uses LSTM's
+    # per-row test predictions.
+    parsed_dca_thresholds = _parse_dca_thresholds(dca_thresholds)
+    dca_rows = _compute_dca_block(
+        result.y_true,
+        result.y_pred_proba,
+        parsed_dca_thresholds,
+    )
+    if dca_rows:
+        payload["decision_curve"] = dca_rows
+
     metrics_out.write_text(
         json.dumps(_nan_to_none(payload), indent=2, sort_keys=False, allow_nan=False)
     )
@@ -1063,6 +1174,7 @@ def sequence_baseline(
             payload=payload, metrics_out=metrics_out, model_out=model_out
         )
         + _render_subgroup_md(subgroup_rows)
+        + _render_dca_md(dca_rows)
     )
 
     metrics = result.metrics
