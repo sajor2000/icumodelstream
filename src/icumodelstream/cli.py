@@ -845,7 +845,16 @@ def sequence_baseline(
     ),
 ) -> None:
     """Run the Phase 5 LSTM sequence baseline and write metrics + state-dict artifacts."""
+    import platform
     import torch  # local import keeps `inspect`/`qc`/`cohort`/`baseline` torch-free
+
+    # macOS + torch + BCEWithLogitsLoss segfaults (SIGSEGV / exit 139) under
+    # the default OMP/MKL threading on Apple Silicon. The test suite pins
+    # set_num_threads(1) inside the CliRunner fixture; the production CLI
+    # needs the same guard (review adv-8 made flesh by smoke run). Linux /
+    # CUDA hosts unaffected.
+    if platform.system() == "Darwin":
+        torch.set_num_threads(1)
 
     resolved_root = _resolve_data_root(data_root)
     tables = _discover(resolved_root)
