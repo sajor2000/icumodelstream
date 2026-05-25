@@ -11,12 +11,23 @@ import typer
 from rich.console import Console
 from rich.table import Table
 
-from icumodelstream.cohorts import CohortSpec, build_adult_icu_cohort
+from icumodelstream.cohorts import CohortSpec, build_adult_icu_cohort, build_cohort_with_waterfall
 from icumodelstream.io import discover_tables, table_inventory
+from icumodelstream.labels import extract_los_label, extract_mortality_labels
 from icumodelstream.models import BaselineResult, save_model
-from icumodelstream.pipeline import BaselinePipelineResult, run_baseline_pipeline
+from icumodelstream.pipeline import (
+    RICH_ASSESSMENT_CATEGORIES,
+    RICH_LAB_CATEGORIES,
+    RICH_RESPIRATORY_DEVICES,
+    RICH_VITAL_CATEGORIES,
+    BaselinePipelineResult,
+    get_admission_anchors,
+    run_baseline_pipeline,
+)
 from icumodelstream.qc import build_qc_report, write_qc_report
 from icumodelstream.schema import validate_table_contracts, validation_results_to_frame
+from icumodelstream.sequences import build_sequence_tensors
+from icumodelstream.torch_train import fit_sequence_model, prepare_split_tensors
 
 app = typer.Typer(help="Local-first CLIF-MIMIC parquet pipeline.")
 console = Console()
@@ -494,6 +505,412 @@ def baseline(
         summary_out=summary_out,
         model_out=model_out,
     )
+
+
+# ---------------------------------------------------------------------------
+# Phase 5: sequence-baseline (LSTM)
+#
+# Mirrors the `baseline` command structure but routes through the LSTM in
+# torch_train.fit_sequence_model instead of LightGBM/logistic. Orchestration
+# is inlined here (rather than living in pipeline.py) because today there is
+# exactly one caller; promote to pipeline.py only when a second appears.
+# ---------------------------------------------------------------------------
+
+
+def _run_sequence_baseline(
+    tables: dict,
+    cohort_spec: CohortSpec,
+    *,
+    window_hours: int,
+    outcome: str,
+    los_threshold_hours: float,
+    include_hospice: bool,
+    hidden_dim: int,
+    n_layers: int,
+    dropout: float,
+    max_epochs: int,
+    patience: int,
+    learning_rate: float,
+    weight_decay: float,
+    batch_size: int,
+    device: str | None,
+    seed: int,
+) -> tuple[Any, Any, Any, dict[str, Any]]:
+    """Run cohort -> labels -> sequences -> LSTM training in one shot.
+
+    Returns (lstm_model, lstm_result, cohort_waterfall, split_meta_dict). The
+    split_meta dict carries the per-split sizes / prevalences / channel
+    metadata that the JSON payload + markdown summary need to render.
+
+    Outcome dispatch mirrors run_baseline_pipeline so mortality/los_gt_7d both
+    flow through the same label-rename ("outcome") contract that
+    fit_sequence_model expects.
+    """
+    if outcome not in {"mortality", "los_gt_7d"}:
+        raise typer.BadParameter(
+            f"outcome must be 'mortality' or 'los_gt_7d', got {outcome!r}."
+        )
+
+    cohort, waterfall = build_cohort_with_waterfall(tables, cohort_spec)
+    if cohort.height == 0:
+        raise typer.BadParameter(
+            "Cohort is empty after applying CohortSpec filters; cannot run sequence baseline. "
+            f"Waterfall: total={waterfall.total_hospitalizations}, "
+            f"after_age={waterfall.after_age_filter}, "
+            f"after_icu={waterfall.after_icu_filter}."
+        )
+
+    if outcome == "mortality":
+        raw_labels = extract_mortality_labels(tables, include_hospice=include_hospice)
+        labels = raw_labels.rename({"mortality": "outcome"})
+    else:  # los_gt_7d
+        raw_labels = extract_los_label(tables, threshold_hours=los_threshold_hours)
+        labels = raw_labels.rename({"long_los": "outcome"})
+
+    cohort_with_labels = cohort.join(labels, on="hospitalization_id", how="inner")
+    if cohort_with_labels.height == 0:
+        raise typer.BadParameter(
+            "No cohort hospitalizations matched extracted labels; cannot run sequence baseline."
+        )
+
+    anchors = get_admission_anchors(tables).join(
+        cohort_with_labels.select("hospitalization_id"),
+        on="hospitalization_id",
+        how="inner",
+    )
+
+    sequences = build_sequence_tensors(
+        tables,
+        cohort_with_labels,
+        anchors,
+        window_hours=int(window_hours),
+        vital_categories=RICH_VITAL_CATEGORIES,
+        lab_categories=RICH_LAB_CATEGORIES,
+        assessment_categories=RICH_ASSESSMENT_CATEGORIES,
+        respiratory_devices=RICH_RESPIRATORY_DEVICES,
+    )
+
+    labels_for_torch = cohort_with_labels.select("hospitalization_id", "outcome")
+    groups_for_torch = cohort_with_labels.select("hospitalization_id", "patient_id")
+
+    # Reproduce the split once for prevalences. fit_sequence_model runs the same
+    # deterministic split internally; this call is cheap (no training) and keeps
+    # split metadata accessible without changing fit_sequence_model's contract.
+    split_tensors = prepare_split_tensors(
+        sequences, labels_for_torch, groups_for_torch, seed=seed
+    )
+    split_meta = {
+        "n_train": int(split_tensors.X_train.shape[0]),
+        "n_val": int(split_tensors.X_val.shape[0]),
+        "n_test": int(split_tensors.X_test.shape[0]),
+        "n_train_patients": int(split_tensors.n_train_patients),
+        "n_val_patients": int(split_tensors.n_val_patients),
+        "n_test_patients": int(split_tensors.n_test_patients),
+        "train_prevalence": float(split_tensors.y_train.mean().item()),
+        "val_prevalence": float(split_tensors.y_val.mean().item()),
+        "test_prevalence": float(split_tensors.y_test.mean().item()),
+        "n_channels": len(sequences.channel_names),
+        "channel_names": list(sequences.channel_names),
+    }
+
+    lstm_model, lstm_result = fit_sequence_model(
+        sequences,
+        labels_for_torch,
+        groups_for_torch,
+        hidden_dim=hidden_dim,
+        n_layers=n_layers,
+        dropout=dropout,
+        max_epochs=max_epochs,
+        patience=patience,
+        learning_rate=learning_rate,
+        weight_decay=weight_decay,
+        batch_size=batch_size,
+        device=device,
+        seed=seed,
+    )
+
+    return lstm_model, lstm_result, waterfall, split_meta
+
+
+def _build_sequence_metrics_payload(
+    *,
+    data_root: Path,
+    result: Any,  # SequenceResult; duck-typed on .metrics + .calibration_table
+    waterfall: Any,
+    split_meta: dict[str, Any],
+    config_snapshot: dict[str, Any],
+    code_version: str | None,
+    generated_at: str,
+) -> dict[str, Any]:
+    """JSON payload for the sequence baseline. Separate from _build_metrics_payload
+    because the LSTM result shape (no logistic comparator, plus epochs metadata)
+    differs enough to deserve its own builder rather than conditional branches.
+    """
+    channel_names = split_meta["channel_names"]
+    n_channels = split_meta["n_channels"]
+    split = {k: v for k, v in split_meta.items() if k not in {"n_channels", "channel_names"}}
+    return {
+        "config": {"data_root_basename": data_root.name, **config_snapshot},
+        "model_type": "lstm",
+        "cohort_waterfall": asdict(waterfall),
+        "n_channels": n_channels,
+        "channel_names": channel_names,
+        "split": split,
+        "model": _baseline_result_to_dict(result),  # works for SequenceResult too
+        "training": {
+            "epochs_trained": int(result.epochs_trained),
+            "early_stopped_at_epoch": result.early_stopped_at_epoch,
+        },
+        "warnings": [],
+        "generated_at": generated_at,
+        "code_version": code_version,
+    }
+
+
+def _build_sequence_markdown_summary(
+    *, payload: dict[str, Any], metrics_out: Path, model_out: Path
+) -> str:
+    """Sequence-specific markdown. Mirrors _build_markdown_summary's structure
+    but covers only one model (LSTM) plus training metadata."""
+    config = payload["config"]
+    waterfall = payload["cohort_waterfall"]
+    split = payload["split"]
+    model = payload["model"]
+    training = payload["training"]
+    metrics = model["metrics"]
+
+    lines: list[str] = []
+    lines.append(f"# Sequence baseline metrics — {payload['generated_at']}")
+    lines.append("")
+    lines.append(f"**Data root:** `{config['data_root_basename']}`")
+    lines.append(f"**Code version:** `{payload.get('code_version')}`")
+    lines.append(f"**Model type:** {payload['model_type']}")
+    lines.append("")
+    lines.append("## Configuration")
+    lines.append("")
+    lines.append("| Param | Value |")
+    lines.append("|---|---|")
+    for key, value in config.items():
+        if key == "data_root_basename":
+            continue
+        if isinstance(value, dict):
+            for k2, v2 in value.items():
+                lines.append(f"| {key}.{k2} | {v2} |")
+        else:
+            lines.append(f"| {key} | {value} |")
+    lines.append("")
+    lines.append("## Cohort waterfall")
+    lines.append("")
+    lines.append(f"- Total hospitalizations: {waterfall['total_hospitalizations']:,}")
+    lines.append(f"- After age filter: {waterfall['after_age_filter']:,}")
+    lines.append(f"- After ICU filter: {waterfall['after_icu_filter']:,}")
+    lines.append(f"- Final: {waterfall['final']:,}")
+    lines.append("")
+    lines.append(f"**Channels:** {payload['n_channels']}")
+    lines.append("")
+    lines.append("## Split")
+    lines.append("")
+    lines.append(
+        f"- Train: {split['n_train']:,} rows, "
+        f"{split['n_train_patients']:,} patients, "
+        f"prevalence = {_format_metric(split['train_prevalence'])}"
+    )
+    lines.append(
+        f"- Val:   {split['n_val']:,} rows, "
+        f"{split['n_val_patients']:,} patients, "
+        f"prevalence = {_format_metric(split['val_prevalence'])}"
+    )
+    lines.append(
+        f"- Test:  {split['n_test']:,} rows, "
+        f"{split['n_test_patients']:,} patients, "
+        f"prevalence = {_format_metric(split['test_prevalence'])}"
+    )
+    lines.append("")
+    lines.append("## Test-set metrics")
+    lines.append("")
+    lines.append("| Metric | Value |")
+    lines.append("|---|---|")
+    for key in (
+        "auroc",
+        "auprc",
+        "brier_score",
+        "prevalence",
+        "calibration_intercept",
+        "calibration_slope",
+    ):
+        lines.append(f"| {key} | {_format_metric(metrics.get(key))} |")
+    lines.append("")
+    lines.append("## Training")
+    lines.append("")
+    lines.append(f"- Epochs trained: {training['epochs_trained']}")
+    lines.append(
+        f"- Early stopped at epoch: {training['early_stopped_at_epoch']}"
+    )
+    lines.append("")
+    lines.append(_render_calibration_md("LSTM reliability", model["calibration_table"]))
+    lines.append("")
+    lines.append("## Artifacts")
+    lines.append("")
+    lines.append(f"- Metrics JSON: `{metrics_out}`")
+    lines.append(
+        f"- LSTM state dict: `{model_out}` (load via "
+        "`LSTMBaseline(input_dim=n_channels, hidden_dim=..., n_layers=..., "
+        "dropout=...); model.load_state_dict(torch.load(path))`)"
+    )
+    return "\n".join(lines)
+
+
+@app.command(name="sequence-baseline")
+def sequence_baseline(
+    data_root: Path = typer.Option(..., help="Directory containing CLIF parquet files."),
+    metrics_out: Path = typer.Option(
+        Path("reports/sequence_metrics.json"), help="Output JSON path."
+    ),
+    summary_out: Path = typer.Option(
+        Path("reports/sequence_summary.md"), help="Output Markdown summary path."
+    ),
+    model_out: Path = typer.Option(
+        Path("models/sequence_baseline.pt"),
+        help="LSTM state-dict path (torch.save format).",
+    ),
+    min_age: int = typer.Option(18, help="Minimum age for adult cohort."),
+    require_icu_location: bool = typer.Option(True, help="Require an ICU-like ADT location."),
+    window_hours: int = typer.Option(24, help="Sequence window in hours from admission."),
+    seed: int = typer.Option(42, help="Random seed for split + model training."),
+    outcome: str = typer.Option(
+        "mortality",
+        help="Outcome label: 'mortality' (default) or 'los_gt_7d'.",
+    ),
+    los_threshold_hours: float = typer.Option(
+        168.0,
+        help="LOS threshold in hours when --outcome=los_gt_7d. Default 168 = 7 days.",
+    ),
+    include_hospice: bool = typer.Option(
+        False, help="Treat 'Hospice' discharge as mortality=1."
+    ),
+    hidden_dim: int = typer.Option(128, help="LSTM hidden dim."),
+    n_layers: int = typer.Option(2, help="LSTM layer count."),
+    dropout: float = typer.Option(0.3, help="LSTM dropout (between layers + before classifier)."),
+    max_epochs: int = typer.Option(20, help="Maximum training epochs."),
+    patience: int = typer.Option(3, help="Early-stopping patience on validation AUROC."),
+    batch_size: int = typer.Option(256, help="Mini-batch size."),
+    learning_rate: float = typer.Option(1e-3, help="AdamW learning rate."),
+    weight_decay: float = typer.Option(1e-4, help="AdamW weight decay."),
+    device: str = typer.Option(
+        "auto",
+        help="Compute device: 'auto' (cuda > mps > cpu), 'cuda', 'mps', or 'cpu'.",
+    ),
+) -> None:
+    """Run the Phase 5 LSTM sequence baseline and write metrics + state-dict artifacts."""
+    import torch  # local import keeps `inspect`/`qc`/`cohort`/`baseline` torch-free
+
+    resolved_root = _resolve_data_root(data_root)
+    tables = _discover(resolved_root)
+
+    cohort_spec = CohortSpec(min_age=min_age, require_icu_location=require_icu_location)
+    device_arg = None if device == "auto" else device
+
+    model, result, waterfall, split_meta = _run_sequence_baseline(
+        tables,
+        cohort_spec,
+        window_hours=window_hours,
+        outcome=outcome,
+        los_threshold_hours=los_threshold_hours,
+        include_hospice=include_hospice,
+        hidden_dim=hidden_dim,
+        n_layers=n_layers,
+        dropout=dropout,
+        max_epochs=max_epochs,
+        patience=patience,
+        learning_rate=learning_rate,
+        weight_decay=weight_decay,
+        batch_size=batch_size,
+        device=device_arg,
+        seed=seed,
+    )
+
+    metrics_out.parent.mkdir(parents=True, exist_ok=True)
+    summary_out.parent.mkdir(parents=True, exist_ok=True)
+    model_out.parent.mkdir(parents=True, exist_ok=True)
+
+    # Move to CPU before saving so the .pt is portable across cuda/mps/cpu loads.
+    torch.save(model.cpu().state_dict(), model_out)
+
+    config_snapshot = {
+        "cohort_spec": asdict(cohort_spec),
+        "window_hours": window_hours,
+        "seed": seed,
+        "outcome": outcome,
+        "los_threshold_hours": los_threshold_hours,
+        "include_hospice": include_hospice,
+        "hidden_dim": hidden_dim,
+        "n_layers": n_layers,
+        "dropout": dropout,
+        "max_epochs": max_epochs,
+        "patience": patience,
+        "batch_size": batch_size,
+        "learning_rate": learning_rate,
+        "weight_decay": weight_decay,
+        "device": device,
+    }
+
+    generated_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    code_version = _git_head_sha()
+    payload = _build_sequence_metrics_payload(
+        data_root=resolved_root,
+        result=result,
+        waterfall=waterfall,
+        split_meta=split_meta,
+        config_snapshot=config_snapshot,
+        code_version=code_version,
+        generated_at=generated_at,
+    )
+
+    metrics_out.write_text(
+        json.dumps(_nan_to_none(payload), indent=2, sort_keys=False, allow_nan=False)
+    )
+    summary_out.write_text(
+        _build_sequence_markdown_summary(
+            payload=payload, metrics_out=metrics_out, model_out=model_out
+        )
+    )
+
+    metrics = result.metrics
+    console.print("")
+    console.print("=== Sequence baseline complete ===")
+    console.print(f"Cohort:   {waterfall.final:,} hospitalizations")
+    console.print(
+        f"Channels: {split_meta['n_channels']} "
+        f"(per-category vitals/labs + assessments + resp flags, first {window_hours}h)"
+    )
+    console.print(
+        f"Split:    {split_meta['n_train']:,} train / "
+        f"{split_meta['n_val']:,} val / "
+        f"{split_meta['n_test']:,} test (by patient_id)"
+    )
+    outcome_label = {"mortality": "Mortality", "los_gt_7d": "LOS > 7d"}.get(
+        outcome, "Outcome"
+    )
+    console.print(
+        f"{outcome_label}: {split_meta['train_prevalence']:.1%} train, "
+        f"{split_meta['test_prevalence']:.1%} test"
+    )
+    console.print("")
+    console.print(
+        "LSTM      "
+        f"AUROC {_format_metric(metrics.get('auroc'))}  "
+        f"AUPRC {_format_metric(metrics.get('auprc'))}  "
+        f"Brier {_format_metric(metrics.get('brier_score'))}  "
+        f"CalibSlope {_format_metric(metrics.get('calibration_slope'))}"
+    )
+    console.print(
+        f"Trained:  {result.epochs_trained} epochs "
+        f"(early stop at epoch={result.early_stopped_at_epoch})"
+    )
+    console.print("")
+    console.print(f"Wrote {metrics_out}")
+    console.print(f"Wrote {summary_out}")
+    console.print(f"Wrote {model_out}")
 
 
 if __name__ == "__main__":
