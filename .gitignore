@@ -50,10 +50,11 @@ configs/local.yaml
 *.csv.gz
 *.csv
 
-# Outputs
+# Outputs (derived artifacts; reproduce with `make baseline` etc.)
 /reports/*.html
 /reports/*.json
 /reports/*.csv
+/reports/*.md
 /models/
 /checkpoints/
 /runs/
