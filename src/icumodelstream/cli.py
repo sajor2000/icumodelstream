@@ -20,10 +20,13 @@ from icumodelstream.pipeline import (
     RICH_LAB_CATEGORIES,
     RICH_RESPIRATORY_DEVICES,
     RICH_VITAL_CATEGORIES,
+    SUPPORTED_SUBGROUP_COLS,
     BaselinePipelineResult,
+    extract_subgroup_labels,
     get_admission_anchors,
     run_baseline_pipeline,
 )
+from icumodelstream.subgroups import compute_subgroup_metrics
 from icumodelstream.qc import build_qc_report, write_qc_report
 from icumodelstream.schema import validate_table_contracts, validation_results_to_frame
 from icumodelstream.sequences import build_sequence_tensors
@@ -155,6 +158,85 @@ def _baseline_result_to_dict(result: BaselineResult) -> dict[str, Any]:
         "metrics": dict(result.metrics),
         "calibration_table": result.calibration_table.to_dicts(),
     }
+
+
+def _parse_subgroup_cols(raw: str) -> list[str]:
+    """Parse the comma-separated --subgroup-cols flag value.
+
+    Empty / whitespace-only input returns ``[]`` (analysis skipped).
+    Unknown column names raise ``typer.BadParameter`` so the CLI fails
+    loudly on typos (per CLAUDE.md rule 7).
+    """
+    if not raw or not raw.strip():
+        return []
+    cols = [c.strip() for c in raw.split(",") if c.strip()]
+    unknown = [c for c in cols if c not in SUPPORTED_SUBGROUP_COLS]
+    if unknown:
+        raise typer.BadParameter(
+            f"Unknown subgroup column(s): {unknown}. "
+            f"Supported: {list(SUPPORTED_SUBGROUP_COLS)}."
+        )
+    return cols
+
+
+def _compute_subgroup_block(
+    tables: dict,
+    test_hospitalization_ids: list[str],
+    y_true: Any,
+    y_pred_proba: Any,
+    subgroup_cols: list[str],
+) -> list[dict[str, Any]]:
+    """Extract labels, compute per-subgroup metrics, return tidy dict list.
+
+    Returns ``[]`` when ``subgroup_cols`` is empty so callers can attach the
+    block unconditionally. The per-row label DataFrame is dropped after
+    metrics compute -- only aggregates make it into the payload, preserving
+    the no-per-row-PHI contract that ``_baseline_result_to_dict`` enforces.
+    """
+    if not subgroup_cols:
+        return []
+    import numpy as np  # local import to keep `inspect` / `qc` / `cohort` numpy-free
+
+    labels_df = extract_subgroup_labels(tables, test_hospitalization_ids, subgroup_cols)
+    groups = {col: labels_df[col].to_numpy() for col in subgroup_cols}
+    metrics_df = compute_subgroup_metrics(
+        np.asarray(y_true), np.asarray(y_pred_proba), groups
+    )
+    return metrics_df.to_dicts()
+
+
+def _render_subgroup_md(rows: list[dict[str, Any]]) -> str:
+    """Render the subgroup-metrics dict-list as a Markdown section.
+
+    Empty input returns "" so callers can append unconditionally.
+    """
+    if not rows:
+        return ""
+    lines = ["", "## Subgroup performance", ""]
+    # Group rows by subgroup_var so each variable gets its own sub-table.
+    by_var: dict[str, list[dict[str, Any]]] = {}
+    for row in rows:
+        by_var.setdefault(row["subgroup_var"], []).append(row)
+    for var, var_rows in by_var.items():
+        lines.append(f"### {var}")
+        lines.append("")
+        lines.append(
+            "| Value | n | Prevalence | AUROC | AUPRC | Brier | Calib intercept | Calib slope | Warning |"
+        )
+        lines.append("|---|---|---|---|---|---|---|---|---|")
+        for r in var_rows:
+            lines.append(
+                f"| {r['subgroup_value']} | {r['n']:,} | "
+                f"{_format_metric(r['prevalence'])} | "
+                f"{_format_metric(r['auroc'])} | "
+                f"{_format_metric(r['auprc'])} | "
+                f"{_format_metric(r['brier_score'])} | "
+                f"{_format_metric(r['calibration_intercept'])} | "
+                f"{_format_metric(r['calibration_slope'])} | "
+                f"{r.get('warning') or ''} |"
+            )
+        lines.append("")
+    return "\n".join(lines)
 
 
 def _build_metrics_payload(
@@ -458,12 +540,19 @@ def baseline(
         168.0,
         help="LOS threshold in hours when --outcome=los_gt_7d. Default 168 = 7 days.",
     ),
+    subgroup_cols: str = typer.Option(
+        "",
+        help="Comma-separated subgroup column list for TRIPOD+AI per-subgroup "
+        "metrics. Empty (default) skips analysis. Supported: "
+        "sex, race_category, ethnicity, age_band, icu_type.",
+    ),
 ) -> None:
     """Run the Phase 4 LightGBM + logistic baseline and write metrics + model artifacts."""
     resolved_root = _resolve_data_root(data_root)
     tables = _discover(resolved_root)
 
     cohort_spec = CohortSpec(min_age=min_age, require_icu_location=require_icu_location)
+    parsed_subgroups = _parse_subgroup_cols(subgroup_cols)
     result = run_baseline_pipeline(
         tables,
         cohort_spec,
@@ -484,6 +573,16 @@ def baseline(
         code_version=code_version,
         generated_at=generated_at,
     )
+    # Subgroup analysis (TRIPOD+AI) — uses LightGBM's per-row predictions.
+    subgroup_rows = _compute_subgroup_block(
+        tables,
+        result.test_hospitalization_ids,
+        result.lightgbm.y_true,
+        result.lightgbm.y_pred_proba,
+        parsed_subgroups,
+    )
+    if subgroup_rows:
+        payload["subgroups"] = subgroup_rows
 
     metrics_out.parent.mkdir(parents=True, exist_ok=True)
     summary_out.parent.mkdir(parents=True, exist_ok=True)
@@ -496,6 +595,7 @@ def baseline(
         _build_markdown_summary(
             payload=payload, metrics_out=metrics_out, model_out=model_out
         )
+        + _render_subgroup_md(subgroup_rows)
     )
     save_model(result.lightgbm_model, model_out)
 
@@ -635,6 +735,9 @@ def _run_sequence_baseline(
     split_tensors = prepare_split_tensors(
         sequences, labels_for_torch, groups_for_torch, seed=seed
     )
+    test_hospitalization_ids = [
+        str(sequences.hospitalization_ids[i]) for i in split_tensors.test_indices
+    ]
     split_meta = {
         "n_train": int(split_tensors.X_train.shape[0]),
         "n_val": int(split_tensors.X_val.shape[0]),
@@ -645,6 +748,7 @@ def _run_sequence_baseline(
         "train_prevalence": float(split_tensors.y_train.mean().item()),
         "val_prevalence": float(split_tensors.y_val.mean().item()),
         "test_prevalence": float(split_tensors.y_test.mean().item()),
+        "test_hospitalization_ids": test_hospitalization_ids,
         "n_channels": len(sequences.channel_names),
         "channel_names": list(sequences.channel_names),
     }
@@ -685,7 +789,11 @@ def _build_sequence_metrics_payload(
     """
     channel_names = split_meta["channel_names"]
     n_channels = split_meta["n_channels"]
-    split = {k: v for k, v in split_meta.items() if k not in {"n_channels", "channel_names"}}
+    split = {
+        k: v
+        for k, v in split_meta.items()
+        if k not in {"n_channels", "channel_names", "test_hospitalization_ids"}
+    }
     return {
         "config": {"data_root_basename": data_root.name, **config_snapshot},
         "model_type": "lstm",
@@ -843,6 +951,12 @@ def sequence_baseline(
         help="Apply BCE pos_weight=n_neg/n_pos. Off by default because it "
         "inflates predicted probabilities (same trap as LightGBM is_unbalance=True).",
     ),
+    subgroup_cols: str = typer.Option(
+        "",
+        help="Comma-separated subgroup column list for TRIPOD+AI per-subgroup "
+        "metrics. Empty (default) skips analysis. Supported: "
+        "sex, race_category, ethnicity, age_band, icu_type.",
+    ),
 ) -> None:
     """Run the Phase 5 LSTM sequence baseline and write metrics + state-dict artifacts."""
     import platform
@@ -929,6 +1043,17 @@ def sequence_baseline(
         code_version=code_version,
         generated_at=generated_at,
     )
+    # Subgroup analysis (TRIPOD+AI) — uses LSTM's per-row test predictions.
+    parsed_subgroups = _parse_subgroup_cols(subgroup_cols)
+    subgroup_rows = _compute_subgroup_block(
+        tables,
+        split_meta["test_hospitalization_ids"],
+        result.y_true,
+        result.y_pred_proba,
+        parsed_subgroups,
+    )
+    if subgroup_rows:
+        payload["subgroups"] = subgroup_rows
 
     metrics_out.write_text(
         json.dumps(_nan_to_none(payload), indent=2, sort_keys=False, allow_nan=False)
@@ -937,6 +1062,7 @@ def sequence_baseline(
         _build_sequence_markdown_summary(
             payload=payload, metrics_out=metrics_out, model_out=model_out
         )
+        + _render_subgroup_md(subgroup_rows)
     )
 
     metrics = result.metrics

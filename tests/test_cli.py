@@ -243,9 +243,19 @@ def _build_toy_clif_with_categories(
     is_expired = rng.uniform(size=n_patients) < prevalence
     discharge_categories = ["Expired" if flag else "Home" for flag in is_expired]
 
-    pl.DataFrame({"patient_id": patient_ids, "age": ages}).write_parquet(
-        tmp_path / "patient.parquet"
-    )
+    # Subgroup-analysis columns (additive — earlier tests didn't need them).
+    sex_categories = ["Male" if i % 2 == 0 else "Female" for i in range(n_patients)]
+    race_categories = ["White" if i % 3 == 0 else "Black" if i % 3 == 1 else "Asian"
+                       for i in range(n_patients)]
+    pl.DataFrame(
+        {
+            "patient_id": patient_ids,
+            "age": ages,
+            "sex_category": sex_categories,
+            "race_category": race_categories,
+            "ethnicity_category": ["Non-Hispanic"] * n_patients,
+        }
+    ).write_parquet(tmp_path / "patient.parquet")
     pl.DataFrame(
         {
             "patient_id": patient_ids,
@@ -253,6 +263,7 @@ def _build_toy_clif_with_categories(
             "admission_dttm": admission_dttms,
             "discharge_dttm": discharge_dttms,
             "discharge_category": discharge_categories,
+            "age_at_admission": ages,  # mirror patient.age into hosp for extract_subgroup_labels
         }
     ).with_columns(
         pl.col("admission_dttm").cast(pl.Datetime(time_zone="UTC")),
@@ -261,8 +272,11 @@ def _build_toy_clif_with_categories(
     pl.DataFrame(
         {
             "hospitalization_id": hospitalization_ids,
-            "location_category": ["ICU"] * n_patients,
+            "location_category": ["MICU" if i % 2 == 0 else "SICU" for i in range(n_patients)],
+            "in_dttm": admission_dttms,
         }
+    ).with_columns(
+        pl.col("in_dttm").cast(pl.Datetime(time_zone="UTC")),
     ).write_parquet(tmp_path / "adt.parquet")
 
     # Vitals with vital_category and vital_value, two categories per hospitalization
@@ -399,3 +413,97 @@ def test_sequence_baseline_command_happy_path(tmp_path: Path) -> None:
     state_dict = torch.load(model_path, weights_only=True)
     assert isinstance(state_dict, dict)
     assert len(state_dict) > 0
+
+
+def test_baseline_subgroup_cols_happy_path(tmp_path: Path) -> None:
+    """--subgroup-cols sex,age_band attaches subgroup rows to JSON and Markdown."""
+    data_root = tmp_path / "data"
+    data_root.mkdir()
+    _build_toy_clif_with_categories(data_root, n_patients=80, prevalence=0.4, seed=1)
+
+    metrics_path = tmp_path / "out" / "metrics.json"
+    summary_path = tmp_path / "out" / "summary.md"
+
+    runner = CliRunner()
+    result = runner.invoke(
+        app,
+        [
+            "baseline",
+            "--data-root", str(data_root),
+            "--metrics-out", str(metrics_path),
+            "--summary-out", str(summary_path),
+            "--seed", "0",
+            "--subgroup-cols", "sex,age_band",
+        ],
+    )
+    assert result.exit_code == 0, (
+        f"CLI failed:\nstdout={result.stdout}\nexc={result.exception}"
+    )
+
+    payload = json.loads(metrics_path.read_text())
+    assert "subgroups" in payload, "subgroups block missing from payload"
+    vars_present = {row["subgroup_var"] for row in payload["subgroups"]}
+    assert vars_present == {"sex", "age_band"}
+    # Per-variable n must sum to the test-set size (no silent drops).
+    n_total = payload["split"]["n_test"]
+    for var in vars_present:
+        sum_n = sum(r["n"] for r in payload["subgroups"] if r["subgroup_var"] == var)
+        assert sum_n == n_total, f"subgroup {var} n-sum {sum_n} != cohort n {n_total}"
+
+    summary = summary_path.read_text()
+    assert "## Subgroup performance" in summary
+    assert "### sex" in summary
+    assert "### age_band" in summary
+
+
+def test_baseline_subgroup_cols_default_empty_omits_key(tmp_path: Path) -> None:
+    """Default (no --subgroup-cols) leaves the payload free of a `subgroups` key."""
+    data_root = tmp_path / "data"
+    data_root.mkdir()
+    _build_toy_clif_with_categories(data_root, n_patients=60, prevalence=0.5, seed=0)
+
+    metrics_path = tmp_path / "out" / "metrics.json"
+    summary_path = tmp_path / "out" / "summary.md"
+
+    runner = CliRunner()
+    result = runner.invoke(
+        app,
+        [
+            "baseline",
+            "--data-root", str(data_root),
+            "--metrics-out", str(metrics_path),
+            "--summary-out", str(summary_path),
+            "--seed", "0",
+        ],
+    )
+    assert result.exit_code == 0, (
+        f"CLI failed:\nstdout={result.stdout}\nexc={result.exception}"
+    )
+    payload = json.loads(metrics_path.read_text())
+    assert "subgroups" not in payload
+    assert "## Subgroup performance" not in summary_path.read_text()
+
+
+def test_baseline_subgroup_cols_unknown_value_fails_loudly(tmp_path: Path) -> None:
+    """Unknown subgroup column fails with typer BadParameter (exit code 2)."""
+    data_root = tmp_path / "data"
+    data_root.mkdir()
+    _build_toy_clif_with_categories(data_root, n_patients=40, prevalence=0.5, seed=0)
+
+    runner = CliRunner()
+    result = runner.invoke(
+        app,
+        [
+            "baseline",
+            "--data-root", str(data_root),
+            "--metrics-out", str(tmp_path / "out" / "metrics.json"),
+            "--summary-out", str(tmp_path / "out" / "summary.md"),
+            "--seed", "0",
+            "--subgroup-cols", "definitely_not_a_real_column",
+        ],
+    )
+    # typer.BadParameter -> click UsageError -> exit code 2.
+    assert result.exit_code == 2, (
+        f"expected exit code 2 (BadParameter), got {result.exit_code}\n"
+        f"stdout={result.stdout}\nexc={result.exception}"
+    )
