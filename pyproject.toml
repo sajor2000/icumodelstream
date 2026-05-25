@@ -32,6 +32,9 @@ ml = [
     "scikit-learn>=1.4",
     "lightgbm>=4.3",
 ]
+ml-dl = [
+    "torch>=2.3",
+]
 
 [project.scripts]
 icumodelstream = "icumodelstream.cli:app"

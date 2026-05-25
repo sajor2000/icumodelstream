@@ -1,7 +1,7 @@
 VENV = .venv
 PY = $(VENV)/bin/python
 
-.PHONY: install test lint format inspect qc cohort baseline notebook
+.PHONY: install install-dl test lint format inspect qc cohort baseline notebook
 
 $(VENV):
 	python3.11 -m venv $(VENV)
@@ -14,6 +14,9 @@ endif
 
 install: $(VENV)
 	$(PY) -m pip install -e '.[dev,ml]'
+
+install-dl: $(VENV)
+	$(PY) -m pip install -e '.[dev,ml,ml-dl]'
 
 test:
 	pytest -q
