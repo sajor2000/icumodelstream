@@ -117,6 +117,11 @@ class BaselinePipelineResult:
     lightgbm_model: Any
     logistic: BaselineResult
     config_snapshot: dict[str, Any]
+    # Hospitalization IDs of the test fold, in the same order as
+    # ``lightgbm.y_true`` / ``lightgbm.y_pred_proba``. Required for subgroup
+    # analysis, decision-curve analysis, and external validation -- all
+    # need to map per-row predictions back to per-row CLIF identity.
+    test_hospitalization_ids: list[str] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
 
 
@@ -422,23 +427,31 @@ def run_baseline_pipeline(
             "Need at least one example of each class."
         )
 
-    # Attach patient_id as a non-feature column so we can recover unique
-    # patient counts per side after splitting. We strip it off X_train /
-    # X_test before handing them to the model layer.
+    # Attach patient_id + hospitalization_id as non-feature sentinel columns
+    # so we can recover unique patient counts per side AND the per-row test
+    # identity (subgroup analysis, decision-curve analysis, external
+    # validation all need to map per-row predictions back to identity).
+    # Strip both sentinels before handing X to the model layer.
     pid_col = "__patient_id"
-    if pid_col in X.columns:
-        raise ValueError(
-            f"Reserved sentinel column {pid_col!r} collides with an existing feature; "
-            "rename the upstream feature or report this as a bug in run_baseline_pipeline."
-        )
-    X_with_pid = X.with_columns(groups.alias(pid_col))
-    X_with_pid_train, X_with_pid_test, y_train, y_test = group_train_test_split(
-        X_with_pid, y, groups, test_size=test_size, seed=seed
+    hid_col = "__hospitalization_id"
+    for sentinel in (pid_col, hid_col):
+        if sentinel in X.columns:
+            raise ValueError(
+                f"Reserved sentinel column {sentinel!r} collides with an existing feature; "
+                "rename the upstream feature or report this as a bug in run_baseline_pipeline."
+            )
+    X_with_ids = X.with_columns(
+        groups.alias(pid_col),
+        full["hospitalization_id"].alias(hid_col),
     )
-    n_train_patients = int(X_with_pid_train[pid_col].n_unique())
-    n_test_patients = int(X_with_pid_test[pid_col].n_unique())
-    X_train = X_with_pid_train.drop(pid_col)
-    X_test = X_with_pid_test.drop(pid_col)
+    X_with_ids_train, X_with_ids_test, y_train, y_test = group_train_test_split(
+        X_with_ids, y, groups, test_size=test_size, seed=seed
+    )
+    n_train_patients = int(X_with_ids_train[pid_col].n_unique())
+    n_test_patients = int(X_with_ids_test[pid_col].n_unique())
+    test_hospitalization_ids = X_with_ids_test[hid_col].to_list()
+    X_train = X_with_ids_train.drop([pid_col, hid_col])
+    X_test = X_with_ids_test.drop([pid_col, hid_col])
 
     n_train = X_train.height
     n_test = X_test.height
@@ -466,6 +479,7 @@ def run_baseline_pipeline(
         lightgbm_model=lightgbm_model,
         logistic=logistic_result,
         config_snapshot=config_snapshot,
+        test_hospitalization_ids=test_hospitalization_ids,
         warnings=warnings,
     )
 
@@ -516,6 +530,11 @@ class SequencePipelineResult:
     lstm: SequenceResult
     lstm_model: Any
     config_snapshot: dict[str, Any]
+    # Hospitalization IDs of the test fold, in the same order as
+    # ``lstm.y_true`` / ``lstm.y_pred_proba``. Recovered from the
+    # ``SplitTensors.test_indices`` returned by ``prepare_split_tensors``
+    # indexed back into the source ``sequences.hospitalization_ids``.
+    test_hospitalization_ids: list[str] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
 
 
@@ -696,6 +715,12 @@ def run_sequence_baseline_pipeline(
     test_prevalence = (
         float(split_tensors.y_test.mean().item()) if n_test > 0 else 0.0
     )
+    # Recover the per-row test identity by indexing back into the source
+    # sequences.hospitalization_ids array. Same split is used downstream by
+    # fit_sequence_model (deterministic under same seed).
+    test_hospitalization_ids = [
+        str(sequences.hospitalization_ids[i]) for i in split_tensors.test_indices
+    ]
 
     lstm_model, lstm_result = fit_sequence_model(
         sequences,
@@ -729,5 +754,132 @@ def run_sequence_baseline_pipeline(
         lstm=lstm_result,
         lstm_model=lstm_model,
         config_snapshot=config_snapshot,
+        test_hospitalization_ids=test_hospitalization_ids,
         warnings=[],
     )
+
+
+SUPPORTED_SUBGROUP_COLS: tuple[str, ...] = (
+    "sex",
+    "race_category",
+    "ethnicity",
+    "age_band",
+    "icu_type",
+)
+
+
+def extract_subgroup_labels(
+    tables: dict[str, TableRef],
+    hospitalization_ids: list[str],
+    subgroup_cols: list[str],
+) -> pl.DataFrame:
+    """Per-hospitalization subgroup labels joined from patient + hospitalization + adt.
+
+    Parameters
+    ----------
+    tables:
+        Discovered CLIF parquet tables.
+    hospitalization_ids:
+        Test-fold hospitalization_ids whose labels we need.
+    subgroup_cols:
+        Subset of ``SUPPORTED_SUBGROUP_COLS``: ``sex``, ``race_category``,
+        ``ethnicity``, ``age_band``, ``icu_type``. Unknown values raise
+        ``ValueError`` so the CLI fails loudly on typos.
+
+    Returns
+    -------
+    polars.DataFrame with one row per input ``hospitalization_id`` (order
+    preserved), and one column per requested subgroup plus ``hospitalization_id``.
+    Null subgroup values stay null -- the consumer
+    (:func:`icumodelstream.subgroups.compute_subgroup_metrics`) buckets them
+    into ``"Unknown"`` per the no-silent-drop contract.
+
+    Raises
+    ------
+    ValueError
+        On unknown subgroup column names. Missing CLIF columns / tables raise
+        from the underlying scan_table calls per CLAUDE.md rule 7.
+    """
+    unknown = set(subgroup_cols) - set(SUPPORTED_SUBGROUP_COLS)
+    if unknown:
+        raise ValueError(
+            f"Unknown subgroup column(s) {sorted(unknown)}. "
+            f"Supported: {list(SUPPORTED_SUBGROUP_COLS)}."
+        )
+
+    # Preserve caller order by starting with a positional id frame.
+    base = pl.DataFrame(
+        {"hospitalization_id": hospitalization_ids, "__row_idx": list(range(len(hospitalization_ids)))}
+    )
+
+    # Patient-level columns: join via hospitalization.patient_id
+    needs_patient = any(c in subgroup_cols for c in ("sex", "race_category", "ethnicity"))
+    if needs_patient:
+        hosp = (
+            scan_table(tables, "hospitalization")
+            .select("hospitalization_id", "patient_id")
+            .collect()
+        )
+        patient_cols = ["patient_id"]
+        if "sex" in subgroup_cols:
+            patient_cols.append("sex_category")
+        if "race_category" in subgroup_cols:
+            patient_cols.append("race_category")
+        if "ethnicity" in subgroup_cols:
+            patient_cols.append("ethnicity_category")
+        patient = scan_table(tables, "patient").select(*patient_cols).collect()
+        base = base.join(hosp, on="hospitalization_id", how="left").join(
+            patient, on="patient_id", how="left"
+        )
+        # Rename to the subgroup keys the caller asked for.
+        renames = {}
+        if "sex" in subgroup_cols:
+            renames["sex_category"] = "sex"
+        if "ethnicity" in subgroup_cols:
+            renames["ethnicity_category"] = "ethnicity"
+        if renames:
+            base = base.rename(renames)
+
+    # age_band: from hospitalization.age_at_admission via subgroups.assign_age_band
+    if "age_band" in subgroup_cols:
+        from icumodelstream.subgroups import assign_age_band as _assign
+
+        ages_df = (
+            scan_table(tables, "hospitalization")
+            .select("hospitalization_id", "age_at_admission")
+            .collect()
+        )
+        base = base.join(ages_df, on="hospitalization_id", how="left")
+        ages_np = base["age_at_admission"].to_numpy()
+        # Polars converts null Int to null Python objects when calling to_numpy()
+        # with object dtype; force object to preserve None for assign_age_band.
+        ages_obj = base["age_at_admission"].to_list()
+        base = base.with_columns(
+            pl.Series("age_band", _assign(ages_obj).tolist(), dtype=pl.Utf8)
+        )
+
+    # icu_type: first adt.location_category per hospitalization (sorted by in_dttm)
+    if "icu_type" in subgroup_cols:
+        adt = scan_table(tables, "adt")
+        adt_cols = set(adt.collect_schema().names())
+        ts_col = "in_dttm" if "in_dttm" in adt_cols else None
+        if ts_col is not None:
+            icu = (
+                adt.select("hospitalization_id", "location_category", ts_col)
+                .sort([ts_col])
+                .group_by("hospitalization_id")
+                .agg(pl.col("location_category").first().alias("icu_type"))
+                .collect()
+            )
+        else:
+            icu = (
+                adt.select("hospitalization_id", "location_category")
+                .group_by("hospitalization_id")
+                .agg(pl.col("location_category").first().alias("icu_type"))
+                .collect()
+            )
+        base = base.join(icu, on="hospitalization_id", how="left")
+
+    # Restore caller order and keep only the requested columns.
+    final_cols = ["hospitalization_id"] + [c for c in subgroup_cols]
+    return base.sort("__row_idx").select(final_cols)
