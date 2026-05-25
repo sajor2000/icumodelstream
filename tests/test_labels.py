@@ -98,6 +98,83 @@ def test_extract_mortality_labels_hospice_opt_in(tmp_path: Path) -> None:
     assert result["mortality"].to_list() == [1, 1]
 
 
+def test_extract_mortality_labels_excludes_open_admissions(tmp_path: Path) -> None:
+    """Hospitalizations with NULL discharge_category (still in hospital) must NOT be labeled 0.
+
+    Per CLAUDE.md rule 7, silently coercing open admissions to mortality=0 poisons training.
+    The right behavior is to exclude those rows from the label set so the cohort join drops
+    them or surfaces the loss to the operator.
+    """
+    pl.DataFrame(
+        {
+            "hospitalization_id": ["h1", "h2", "h3"],
+            "discharge_category": ["Expired", "Home", None],
+        }
+    ).write_parquet(tmp_path / "hospitalization.parquet")
+
+    tables = discover_tables(tmp_path)
+    result = extract_mortality_labels(tables).sort("hospitalization_id")
+
+    # h3 (still admitted) must NOT appear with mortality=0
+    assert "h3" not in result["hospitalization_id"].to_list()
+    assert result.height == 2
+
+
+def test_extract_mortality_labels_died_and_deceased_vocabularies(tmp_path: Path) -> None:
+    """Non-MIMIC CLIF variants encode death as 'Died', 'Deceased', 'Dead/Expired'.
+
+    The matcher must recognize these in addition to 'Expired' or it silently labels every
+    death as mortality=0.
+    """
+    pl.DataFrame(
+        {
+            "hospitalization_id": ["h1", "h2", "h3", "h4", "h5"],
+            "discharge_category": ["Died", "Deceased", "Dead/Expired", "Expired", "Home"],
+        }
+    ).write_parquet(tmp_path / "hospitalization.parquet")
+
+    tables = discover_tables(tmp_path)
+    result = extract_mortality_labels(tables).sort("hospitalization_id")
+
+    assert result["mortality"].to_list() == [1, 1, 1, 1, 0]
+
+
+def test_extract_mortality_labels_raises_when_no_values_match(tmp_path: Path) -> None:
+    """If the discharge column exists but NO rows match any mortality vocabulary, the
+    extractor should fail loudly rather than silently return all zeros (which the
+    pipeline only catches downstream as a confusing 'no deaths in cohort' error).
+    """
+    pl.DataFrame(
+        {
+            "hospitalization_id": ["h1", "h2"],
+            "discharge_category": ["Home", "SNF"],  # neither is a known death vocabulary
+        }
+    ).write_parquet(tmp_path / "hospitalization.parquet")
+
+    tables = discover_tables(tmp_path)
+
+    with pytest.raises(ValueError, match="no rows match"):
+        extract_mortality_labels(tables)
+
+
+def test_extract_mortality_labels_deduplicates_hospitalization_id(tmp_path: Path) -> None:
+    """Duplicate hospitalization_id rows in the source must collapse to a single label
+    row so downstream joins don't fan out the cohort.
+    """
+    pl.DataFrame(
+        {
+            "hospitalization_id": ["h1", "h1", "h2"],  # h1 duplicated
+            "discharge_category": ["Expired", "Expired", "Home"],
+        }
+    ).write_parquet(tmp_path / "hospitalization.parquet")
+
+    tables = discover_tables(tmp_path)
+    result = extract_mortality_labels(tables).sort("hospitalization_id")
+
+    assert result["hospitalization_id"].to_list() == ["h1", "h2"]
+    assert result.height == 2
+
+
 def test_extract_mortality_labels_schema(tmp_path: Path) -> None:
     """Output schema must be exactly hospitalization_id + integer mortality column."""
     pl.DataFrame(

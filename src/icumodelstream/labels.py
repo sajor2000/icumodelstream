@@ -23,14 +23,28 @@ DISCHARGE_CATEGORY_CANDIDATES = (
     "discharge_disposition",
     "discharge_to",
 )
-MORTALITY_VALUES = frozenset({"expired"})
-HOSPICE_VALUES = frozenset({"hospice"})
+MORTALITY_VALUES = frozenset({
+    "expired",          # CLIF 2.x / MIMIC canonical
+    "died",
+    "deceased",
+    "death",
+    "dead/expired",     # Rush-CLIF variant
+    "expired in hospital",
+})
+HOSPICE_VALUES = frozenset({"hospice", "discharged to hospice"})
 
 
 def extract_mortality_labels(
     tables: dict[str, TableRef], include_hospice: bool = False
 ) -> pl.DataFrame:
     """Return one row per hospitalization with an in-hospital mortality label.
+
+    Rows with a NULL discharge value (e.g., patients still admitted) are EXCLUDED rather
+    than silently coerced to mortality=0; the cohort-join then drops them, and the caller
+    can compare cohort.height vs label.height to see how many were dropped.
+
+    Raises ValueError if no rows match any known mortality vocabulary, which indicates
+    either a label-vocabulary mismatch or a cohort with zero deaths.
 
     Parameters
     ----------
@@ -58,8 +72,9 @@ def extract_mortality_labels(
     if include_hospice:
         positive_values |= HOSPICE_VALUES
 
-    return (
-        lf.select(
+    result = (
+        lf.filter(pl.col(discharge_col).is_not_null())
+        .select(
             pl.col("hospitalization_id"),
             pl.col(discharge_col)
             .cast(pl.Utf8)
@@ -69,6 +84,20 @@ def extract_mortality_labels(
             .cast(pl.Int8)
             .alias("mortality"),
         )
-        .with_columns(pl.col("mortality").fill_null(0))
+        .unique(subset=["hospitalization_id"])
         .collect()
     )
+
+    if result.height > 0 and int(result["mortality"].sum()) == 0:
+        observed = sorted({
+            v for v in lf.select(pl.col(discharge_col).cast(pl.Utf8)).collect().to_series().to_list()
+            if v is not None
+        })
+        raise ValueError(
+            f"extract_mortality_labels: no rows match any known mortality vocabulary "
+            f"in column {discharge_col!r}. Looked for any of {sorted(positive_values)}; "
+            f"observed values: {observed[:20]}{' ...' if len(observed) > 20 else ''}. "
+            f"Extend MORTALITY_VALUES if the source uses a different vocabulary."
+        )
+
+    return result

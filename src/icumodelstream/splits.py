@@ -47,6 +47,7 @@ def group_train_test_split(
     groups: pl.Series,
     test_size: float = 0.2,
     seed: int = 42,
+    stratify: bool = False,
 ) -> tuple[pl.DataFrame, pl.DataFrame, pl.Series, pl.Series]:
     """Split (X, y) into train/test with no group shared across both sides.
 
@@ -94,9 +95,36 @@ def group_train_test_split(
         all_idx = np.arange(len(X), dtype=np.int64)
         return X[all_idx], X[empty_idx], y[all_idx], y[empty_idx]
 
-    splitter = GroupShuffleSplit(n_splits=1, test_size=test_size, random_state=seed)
-    # GroupShuffleSplit only inspects len(X) and groups; a placeholder X is fine.
-    train_idx, test_idx = next(splitter.split(np.zeros(len(X)), groups=groups_np))
+    if stratify:
+        # Stratified-group split: pick the split (out of a small number of candidates)
+        # whose test fold's positive prevalence is closest to the global prevalence
+        # AND has at least one positive. Necessary at low prevalence where a single
+        # GroupShuffleSplit can produce an all-negative test fold (finding #3).
+        y_np = y.to_numpy()
+        global_prev = float(y_np.mean())
+        best = None
+        best_score = float("inf")
+        for candidate_seed in range(seed, seed + 32):
+            splitter = GroupShuffleSplit(n_splits=1, test_size=test_size, random_state=candidate_seed)
+            tr, te = next(splitter.split(np.zeros(len(X)), groups=groups_np))
+            if len(te) == 0 or y_np[te].sum() == 0:
+                continue
+            te_prev = float(y_np[te].mean())
+            score = abs(te_prev - global_prev)
+            if score < best_score:
+                best = (tr, te)
+                best_score = score
+        if best is None:
+            raise ValueError(
+                "stratify=True: could not find a group split with any positives in the test fold "
+                "after 32 seed attempts. Cohort is too small or prevalence too low for a stratified "
+                "group split; reduce test_size or fall back to stratify=False."
+            )
+        train_idx, test_idx = best
+    else:
+        splitter = GroupShuffleSplit(n_splits=1, test_size=test_size, random_state=seed)
+        # GroupShuffleSplit only inspects len(X) and groups; a placeholder X is fine.
+        train_idx, test_idx = next(splitter.split(np.zeros(len(X)), groups=groups_np))
 
     X_train = X[train_idx]
     X_test = X[test_idx]

@@ -117,6 +117,18 @@ def _git_head_sha() -> str | None:
     return sha or None
 
 
+def _nan_to_none(obj: Any) -> Any:
+    """Recursively convert NaN floats to None for strict-JSON output (RFC 8259)."""
+    import math
+    if isinstance(obj, float) and math.isnan(obj):
+        return None
+    if isinstance(obj, dict):
+        return {k: _nan_to_none(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_nan_to_none(v) for v in obj]
+    return obj
+
+
 def _baseline_result_to_dict(result: BaselineResult) -> dict[str, Any]:
     """Serialize a BaselineResult to JSON-friendly dict.
 
@@ -147,6 +159,7 @@ def _build_metrics_payload(
         "test_size": snap["test_size"],
         "seed": snap["seed"],
         "include_hospice": snap["include_hospice"],
+        "feature_set": snap.get("feature_set", "basic"),
     }
     return {
         "config": config,
@@ -241,6 +254,7 @@ def _build_markdown_summary(
     lines.append(f"| test_size | {config['test_size']} |")
     lines.append(f"| seed | {config['seed']} |")
     lines.append(f"| include_hospice | {str(config['include_hospice']).lower()} |")
+    lines.append(f"| feature_set | {config.get('feature_set', 'basic')} |")
     lines.append("")
     lines.append("## Cohort waterfall")
     lines.append("")
@@ -400,6 +414,12 @@ def baseline(
     include_hospice: bool = typer.Option(
         False, help="Treat 'Hospice' discharge as mortality=1."
     ),
+    feature_set: str = typer.Option(
+        "basic",
+        help="Feature richness. 'basic' = 8 aggregate vitals+labs columns; "
+        "'rich' = per-category vitals (HR, SBP, etc.) + per-category labs + GCS/RASS + "
+        "respiratory device flags (~85 features).",
+    ),
 ) -> None:
     """Run the Phase 4 LightGBM + logistic baseline and write metrics + model artifacts."""
     resolved_root = _resolve_data_root(data_root)
@@ -413,6 +433,7 @@ def baseline(
         test_size=test_size,
         seed=seed,
         include_hospice=include_hospice,
+        feature_set=feature_set,
     )
 
     generated_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -428,7 +449,9 @@ def baseline(
     summary_out.parent.mkdir(parents=True, exist_ok=True)
     model_out.parent.mkdir(parents=True, exist_ok=True)
 
-    metrics_out.write_text(json.dumps(payload, indent=2, sort_keys=False))
+    metrics_out.write_text(
+        json.dumps(_nan_to_none(payload), indent=2, sort_keys=False, allow_nan=False)
+    )
     summary_out.write_text(
         _build_markdown_summary(
             payload=payload, metrics_out=metrics_out, model_out=model_out

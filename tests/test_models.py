@@ -171,6 +171,41 @@ def test_all_zero_outcome_raises() -> None:
         fit_logistic_baseline(X_train, y_train, X_test, y_test)
 
 
+def test_single_class_y_test_yields_nan_metrics_not_crash() -> None:
+    """When y_test is single-class, AUROC/AUPRC are undefined — return NaN gracefully
+    rather than crashing (finding #2). The pipeline can then surface a clear error to
+    the operator instead of an unhandled sklearn ValueError mid-training.
+    """
+    X, _ = _make_xy(n=100)
+    y_train = pl.Series("label", [0, 1] * 35)
+    y_test = pl.Series("label", [0] * 30)  # all-negative test fold
+    X_train, X_test = X[:70], X[70:]
+
+    _, result = fit_lightgbm_baseline(X_train, y_train, X_test, y_test, seed=0)
+
+    assert np.isnan(result.metrics["auroc"])
+    assert np.isnan(result.metrics["auprc"])
+    assert np.isnan(result.metrics["calibration_intercept"])
+
+
+def test_calibration_table_uses_fixed_decile_bins() -> None:
+    """Bin edges must be model-independent (fixed deciles 0.0..1.0) so calibration
+    tables from LightGBM and logistic are visually comparable on the same test set.
+    """
+    X, y = _make_xy(n=300, prevalence=0.3)
+    X_train, X_test, y_train, y_test = _split(X, y)
+
+    _, lgbm_res = fit_lightgbm_baseline(X_train, y_train, X_test, y_test, seed=0)
+    _, log_res = fit_logistic_baseline(X_train, y_train, X_test, y_test, seed=0)
+
+    # Both tables must reference the same bin index set; with fixed deciles we expect
+    # bins in {0..9}, and both models share the index space.
+    lgbm_bins = set(lgbm_res.calibration_table["bin"].to_list())
+    log_bins = set(log_res.calibration_table["bin"].to_list())
+    assert lgbm_bins.issubset(set(range(10)))
+    assert log_bins.issubset(set(range(10)))
+
+
 def test_lightgbm_handles_nulls_without_imputation() -> None:
     """Pin the 'no imputation for LightGBM' contract: half the values are null."""
     X, y = _make_xy(n=200)

@@ -340,3 +340,202 @@ def test_aggregate_windowed_raises_on_missing_dttm_col(tmp_path: Path) -> None:
         aggregate_numeric_table_windowed(
             tables, "vitals", "vitals", anchors=anchors, window_hours=24
         )
+
+
+# ---------------------------------------------------------------------------
+# aggregate_numeric_table_per_category
+# ---------------------------------------------------------------------------
+
+
+def _write_vitals_with_category(
+    path: Path,
+    hospitalization_ids: list,
+    categories: list[str],
+    recorded_dttms: list[datetime],
+    values: list[float],
+) -> None:
+    df = pl.DataFrame(
+        {
+            "hospitalization_id": hospitalization_ids,
+            "vital_category": categories,
+            "recorded_dttm": recorded_dttms,
+            "vital_value": values,
+        }
+    ).with_columns(pl.col("recorded_dttm").cast(pl.Datetime(time_zone="UTC")))
+    df.write_parquet(path)
+
+
+def test_per_category_aggregation_happy_path(tmp_path: Path) -> None:
+    """One column-block per category, each with mean/min/max/n."""
+    from icumodelstream.features import aggregate_numeric_table_per_category
+
+    anchor = datetime(2024, 1, 1, 0, 0, tzinfo=timezone.utc)
+    _write_vitals_with_category(
+        tmp_path / "vitals.parquet",
+        hospitalization_ids=[1, 1, 1, 1, 1],
+        categories=["heart_rate", "heart_rate", "sbp", "sbp", "spo2"],
+        recorded_dttms=[anchor + timedelta(hours=h) for h in [1, 2, 3, 4, 5]],
+        values=[80.0, 90.0, 120.0, 130.0, 98.0],
+    )
+    tables = discover_tables(tmp_path)
+    anchors = pl.DataFrame(
+        {"hospitalization_id": [1], "anchor_dttm": [anchor]}
+    ).with_columns(pl.col("anchor_dttm").cast(pl.Datetime(time_zone="UTC")))
+
+    result = aggregate_numeric_table_per_category(
+        tables, "vitals", "vital_category",
+        categories=["heart_rate", "sbp", "spo2"],
+        prefix_template="vitals_{category}",
+        anchors=anchors, window_hours=24,
+    )
+
+    assert result.height == 1
+    row = result.row(0, named=True)
+    assert row["vitals_heart_rate_mean"] == pytest.approx(85.0)
+    assert row["vitals_heart_rate_n"] == 2
+    assert row["vitals_sbp_mean"] == pytest.approx(125.0)
+    assert row["vitals_sbp_n"] == 2
+    assert row["vitals_spo2_mean"] == pytest.approx(98.0)
+    assert row["vitals_spo2_n"] == 1
+
+
+def test_per_category_missing_category_is_zero_n(tmp_path: Path) -> None:
+    """A category with no rows in window gets _n=0 and null mean/min/max."""
+    from icumodelstream.features import aggregate_numeric_table_per_category
+
+    anchor = datetime(2024, 1, 1, 0, 0, tzinfo=timezone.utc)
+    _write_vitals_with_category(
+        tmp_path / "vitals.parquet",
+        hospitalization_ids=[1, 1],
+        categories=["heart_rate", "heart_rate"],
+        recorded_dttms=[anchor + timedelta(hours=1), anchor + timedelta(hours=2)],
+        values=[80.0, 90.0],
+    )
+    tables = discover_tables(tmp_path)
+    anchors = pl.DataFrame(
+        {"hospitalization_id": [1], "anchor_dttm": [anchor]}
+    ).with_columns(pl.col("anchor_dttm").cast(pl.Datetime(time_zone="UTC")))
+
+    result = aggregate_numeric_table_per_category(
+        tables, "vitals", "vital_category",
+        categories=["heart_rate", "lactate"],  # lactate has no rows
+        prefix_template="vitals_{category}",
+        anchors=anchors, window_hours=24,
+    )
+    row = result.row(0, named=True)
+    assert row["vitals_heart_rate_n"] == 2
+    assert row["vitals_lactate_n"] == 0
+    assert row["vitals_lactate_mean"] is None
+
+
+def test_per_category_safe_column_name(tmp_path: Path) -> None:
+    """Categories with spaces/hyphens produce safe column names."""
+    from icumodelstream.features import _safe_category_name
+
+    assert _safe_category_name("heart_rate") == "heart_rate"
+    assert _safe_category_name("High Flow NC") == "high_flow_nc"
+    assert _safe_category_name("Nasal-Cannula") == "nasal_cannula"
+
+
+def test_per_category_respects_window(tmp_path: Path) -> None:
+    """Rows outside [anchor, anchor + window_hours) are excluded per category."""
+    from icumodelstream.features import aggregate_numeric_table_per_category
+
+    anchor = datetime(2024, 1, 1, 0, 0, tzinfo=timezone.utc)
+    _write_vitals_with_category(
+        tmp_path / "vitals.parquet",
+        hospitalization_ids=[1, 1, 1],
+        categories=["heart_rate", "heart_rate", "heart_rate"],
+        recorded_dttms=[
+            anchor + timedelta(hours=1),    # in
+            anchor + timedelta(hours=23),   # in
+            anchor + timedelta(hours=25),   # OUT
+        ],
+        values=[80.0, 90.0, 9999.0],
+    )
+    tables = discover_tables(tmp_path)
+    anchors = pl.DataFrame(
+        {"hospitalization_id": [1], "anchor_dttm": [anchor]}
+    ).with_columns(pl.col("anchor_dttm").cast(pl.Datetime(time_zone="UTC")))
+
+    result = aggregate_numeric_table_per_category(
+        tables, "vitals", "vital_category",
+        categories=["heart_rate"],
+        prefix_template="vitals_{category}",
+        anchors=anchors, window_hours=24,
+    )
+    row = result.row(0, named=True)
+    assert row["vitals_heart_rate_n"] == 2  # the +25h row excluded
+    assert row["vitals_heart_rate_max"] == pytest.approx(90.0)
+
+
+# ---------------------------------------------------------------------------
+# respiratory_support_indicator
+# ---------------------------------------------------------------------------
+
+
+def test_respiratory_indicator_happy_path(tmp_path: Path) -> None:
+    """One Int8 0/1 column per device_category, indicating presence in window."""
+    from icumodelstream.features import respiratory_support_indicator
+
+    anchor = datetime(2024, 1, 1, 0, 0, tzinfo=timezone.utc)
+    pl.DataFrame(
+        {
+            "hospitalization_id": [1, 1, 2],
+            "recorded_dttm": [
+                anchor + timedelta(hours=1),
+                anchor + timedelta(hours=5),
+                anchor + timedelta(hours=2),
+            ],
+            "device_category": ["IMV", "Nasal Cannula", "Nasal Cannula"],
+        }
+    ).with_columns(pl.col("recorded_dttm").cast(pl.Datetime(time_zone="UTC"))).write_parquet(
+        tmp_path / "respiratory_support.parquet"
+    )
+    tables = discover_tables(tmp_path)
+    anchors = pl.DataFrame(
+        {"hospitalization_id": [1, 2], "anchor_dttm": [anchor, anchor]}
+    ).with_columns(pl.col("anchor_dttm").cast(pl.Datetime(time_zone="UTC")))
+
+    result = respiratory_support_indicator(
+        tables,
+        device_categories=["IMV", "Nasal Cannula", "CPAP"],
+        anchors=anchors, window_hours=24,
+    ).sort("hospitalization_id")
+
+    # Patient 1: had IMV and Nasal Cannula in window
+    row1 = result.filter(pl.col("hospitalization_id") == 1).row(0, named=True)
+    assert row1["resp_imv"] == 1
+    assert row1["resp_nasal_cannula"] == 1
+    assert row1["resp_cpap"] == 0
+    # Patient 2: had only Nasal Cannula
+    row2 = result.filter(pl.col("hospitalization_id") == 2).row(0, named=True)
+    assert row2["resp_imv"] == 0
+    assert row2["resp_nasal_cannula"] == 1
+    assert row2["resp_cpap"] == 0
+
+
+def test_respiratory_indicator_no_rows_in_window(tmp_path: Path) -> None:
+    """A hospitalization with no respiratory_support rows in window gets all-zero flags."""
+    from icumodelstream.features import respiratory_support_indicator
+
+    anchor = datetime(2024, 1, 1, 0, 0, tzinfo=timezone.utc)
+    pl.DataFrame(
+        {
+            "hospitalization_id": [1],
+            "recorded_dttm": [anchor + timedelta(hours=48)],  # outside 24h window
+            "device_category": ["IMV"],
+        }
+    ).with_columns(pl.col("recorded_dttm").cast(pl.Datetime(time_zone="UTC"))).write_parquet(
+        tmp_path / "respiratory_support.parquet"
+    )
+    tables = discover_tables(tmp_path)
+    anchors = pl.DataFrame(
+        {"hospitalization_id": [1], "anchor_dttm": [anchor]}
+    ).with_columns(pl.col("anchor_dttm").cast(pl.Datetime(time_zone="UTC")))
+
+    result = respiratory_support_indicator(
+        tables, device_categories=["IMV"],
+        anchors=anchors, window_hours=24,
+    )
+    assert result.row(0, named=True)["resp_imv"] == 0

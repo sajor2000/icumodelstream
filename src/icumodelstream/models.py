@@ -141,15 +141,16 @@ def _calibration_intercept_slope(
 def _calibration_table(
     y_true: np.ndarray, y_pred_proba: np.ndarray
 ) -> pl.DataFrame:
-    """Quantile-bin predictions into up to 10 bins; report mean pred vs actual."""
-    # qcut with duplicates='drop' collapses tied quantile edges so heavily
-    # tied predictions (common at low prevalence) do not crash this helper.
-    bins = pd.qcut(
-        y_pred_proba, q=_N_CALIBRATION_BINS, labels=False, duplicates="drop"
-    )
-    df = pd.DataFrame(
-        {"bin": bins, "y_true": y_true, "y_pred": y_pred_proba}
-    )
+    """Bin predictions into fixed deciles (0.0, 0.1, ..., 1.0) and report mean pred vs actual.
+
+    Fixed deciles (rather than quantile bins) make calibration tables comparable across
+    models on the same test set and across runs on different data. Empty bins are
+    preserved with NaN means so users can see where predictions concentrate.
+    """
+    edges = np.linspace(0.0, 1.0, _N_CALIBRATION_BINS + 1)
+    # np.digitize returns 1..N for in-range values; clip to 0..N-1 for label semantics.
+    bin_idx = np.clip(np.digitize(y_pred_proba, edges[1:-1], right=False), 0, _N_CALIBRATION_BINS - 1)
+    df = pd.DataFrame({"bin": bin_idx, "y_true": y_true, "y_pred": y_pred_proba})
     grouped = (
         df.groupby("bin", sort=True)
         .agg(mean_pred=("y_pred", "mean"), mean_actual=("y_true", "mean"), count=("y_true", "size"))
@@ -166,11 +167,17 @@ def _calibration_table(
 def _compute_metrics(
     y_true: np.ndarray, y_pred_proba: np.ndarray
 ) -> dict[str, float]:
-    """Discrimination (AUROC, AUPRC), Brier, prevalence, and calibration."""
+    """Discrimination (AUROC, AUPRC), Brier, prevalence, and calibration.
+
+    Returns NaN for AUROC/AUPRC when y_true is single-class — discrimination metrics
+    are undefined in that case. The caller (pipeline / CLI) should treat NaN as
+    "test set degenerate, retrain with a stratified split or larger fold".
+    """
     intercept, slope = _calibration_intercept_slope(y_true, y_pred_proba)
+    single_class = len(np.unique(y_true)) < 2
     return {
-        "auroc": float(roc_auc_score(y_true, y_pred_proba)),
-        "auprc": float(average_precision_score(y_true, y_pred_proba)),
+        "auroc": float("nan") if single_class else float(roc_auc_score(y_true, y_pred_proba)),
+        "auprc": float("nan") if single_class else float(average_precision_score(y_true, y_pred_proba)),
         "brier_score": float(brier_score_loss(y_true, y_pred_proba)),
         "prevalence": float(y_true.mean()),
         "calibration_intercept": intercept,

@@ -28,7 +28,11 @@ from icumodelstream.cohorts import (
     CohortWaterfall,
     build_cohort_with_waterfall,
 )
-from icumodelstream.features import aggregate_numeric_table_windowed
+from icumodelstream.features import (
+    aggregate_numeric_table_per_category,
+    aggregate_numeric_table_windowed,
+    respiratory_support_indicator,
+)
 from icumodelstream.io import TableRef, scan_table
 from icumodelstream.labels import extract_mortality_labels
 from icumodelstream.models import (
@@ -37,6 +41,25 @@ from icumodelstream.models import (
     fit_logistic_baseline,
 )
 from icumodelstream.splits import group_train_test_split
+
+# Rich feature-set vocabularies, validated against the observed CLIF-MIMIC
+# data dictionary (docs/data_dictionary_notes.md). Each tuple lists the
+# CLIF category values that are common enough across MIMIC to be worth
+# including. Adding a category outside the observed vocabulary is harmless
+# (the aggregation simply produces _n=0 with null mean/min/max) so this
+# list can grow without breaking the pipeline.
+
+RICH_VITAL_CATEGORIES: tuple[str, ...] = (
+    "heart_rate", "sbp", "dbp", "map", "respiratory_rate", "spo2", "temp_c",
+)
+RICH_LAB_CATEGORIES: tuple[str, ...] = (
+    "sodium", "potassium", "chloride", "bicarbonate", "bun", "creatinine",
+    "glucose_serum", "calcium_total", "magnesium", "lactate", "hemoglobin", "wbc",
+)
+RICH_ASSESSMENT_CATEGORIES: tuple[str, ...] = ("gcs_total", "RASS")
+RICH_RESPIRATORY_DEVICES: tuple[str, ...] = (
+    "IMV", "NIPPV", "High Flow NC", "Nasal Cannula", "CPAP",
+)
 
 
 def get_admission_anchors(tables: dict[str, TableRef]) -> pl.DataFrame:
@@ -61,6 +84,7 @@ def get_admission_anchors(tables: dict[str, TableRef]) -> pl.DataFrame:
     return (
         lf.select("hospitalization_id", "admission_dttm")
         .rename({"admission_dttm": "anchor_dttm"})
+        .unique(subset=["hospitalization_id"])
         .collect()
     )
 
@@ -127,16 +151,10 @@ def _build_feature_matrix(
     anchors: pl.DataFrame,
     window_hours: float,
 ) -> tuple[pl.DataFrame, list[str], list[str]]:
-    """Compute vitals + labs windowed features and join into a single matrix.
+    """Basic feature set: vitals + labs aggregated as single columns each.
 
-    Returns ``(matrix, feature_names, warnings)`` where ``matrix`` carries
-    ``hospitalization_id`` plus all feature columns (no patient_id, no
-    label yet) and ``feature_names`` lists feature columns in matrix order.
-
-    Vitals is the LEFT base when present (typically the larger table), labs
-    is left-joined on. If only one of the two is present, that one becomes
-    the base. If neither is usable the caller raises -- this helper just
-    reports an empty matrix.
+    Returns ``(matrix, feature_names, warnings)``. Produces 8 features when
+    both vitals and labs are present (mean/min/max/n for each).
     """
     warnings: list[str] = []
     vitals = _try_windowed_features(
@@ -159,6 +177,110 @@ def _build_feature_matrix(
     return matrix, feature_names, warnings
 
 
+def _try_per_category(
+    tables: dict[str, TableRef],
+    table_name: str,
+    category_column: str,
+    categories: tuple[str, ...],
+    prefix_template: str,
+    anchors: pl.DataFrame,
+    window_hours: float,
+    cohort: pl.DataFrame,
+    warnings: list[str],
+) -> pl.DataFrame | None:
+    """Per-category windowed aggregation with graceful skip on missing table."""
+    if table_name not in tables:
+        warnings.append(
+            f"{table_name} table not found; skipping per-category features."
+        )
+        return None
+    try:
+        return aggregate_numeric_table_per_category(
+            tables,
+            table_name,
+            category_column=category_column,
+            categories=list(categories),
+            prefix_template=prefix_template,
+            anchors=anchors,
+            window_hours=window_hours,
+            cohort=cohort,
+        )
+    except ValueError as e:
+        warnings.append(
+            f"{table_name} per-category features skipped: {type(e).__name__}: {e}"
+        )
+        return None
+
+
+def _build_rich_feature_matrix(
+    tables: dict[str, TableRef],
+    cohort: pl.DataFrame,
+    anchors: pl.DataFrame,
+    window_hours: float,
+) -> tuple[pl.DataFrame, list[str], list[str]]:
+    """Rich feature set: per-category vitals + labs + assessments + resp flags.
+
+    With the default RICH_* vocabularies this produces roughly 7+12+2 = 21
+    "channels" * 4 stats = 84 numeric features plus 5 respiratory device
+    indicator flags, for ~89 features total. Missing tables produce
+    warnings rather than failure (the model layer still gets all categories
+    in the schema, just with _n=0 and null aggregates for absent ones).
+    """
+    warnings: list[str] = []
+    parts: list[pl.DataFrame] = []
+
+    vitals = _try_per_category(
+        tables, "vitals", "vital_category", RICH_VITAL_CATEGORIES,
+        "vitals_{category}", anchors, window_hours, cohort, warnings,
+    )
+    if vitals is not None:
+        parts.append(vitals)
+
+    labs = _try_per_category(
+        tables, "labs", "lab_category", RICH_LAB_CATEGORIES,
+        "labs_{category}", anchors, window_hours, cohort, warnings,
+    )
+    if labs is not None:
+        parts.append(labs)
+
+    assessments = _try_per_category(
+        tables, "patient_assessments", "assessment_category",
+        RICH_ASSESSMENT_CATEGORIES, "assess_{category}",
+        anchors, window_hours, cohort, warnings,
+    )
+    if assessments is not None:
+        parts.append(assessments)
+
+    if "respiratory_support" in tables:
+        try:
+            resp = respiratory_support_indicator(
+                tables,
+                device_categories=list(RICH_RESPIRATORY_DEVICES),
+                anchors=anchors,
+                window_hours=window_hours,
+                cohort=cohort,
+            )
+            parts.append(resp)
+        except ValueError as e:
+            warnings.append(
+                f"respiratory_support indicators skipped: {type(e).__name__}: {e}"
+            )
+    else:
+        warnings.append(
+            "respiratory_support table not found; skipping IMV/NIPPV/CPAP flags."
+        )
+
+    if not parts:
+        return pl.DataFrame({"hospitalization_id": []}), [], warnings
+
+    matrix = parts[0]
+    for part in parts[1:]:
+        matrix = matrix.join(part, on="hospitalization_id", how="left")
+
+    feature_names = [c for c in matrix.columns if c != "hospitalization_id"]
+    return matrix, feature_names, warnings
+
+
 def run_baseline_pipeline(
     tables: dict[str, TableRef],
     cohort_spec: CohortSpec,
@@ -166,6 +288,7 @@ def run_baseline_pipeline(
     test_size: float = 0.2,
     seed: int = 42,
     include_hospice: bool = False,
+    feature_set: str = "basic",
 ) -> BaselinePipelineResult:
     """Run the full Phase 4 baseline: cohort -> labels -> features -> models.
 
@@ -185,19 +308,31 @@ def run_baseline_pipeline(
         holdout.
     include_hospice:
         If True, hospitalizations discharged to hospice count as mortality=1.
+    feature_set:
+        Either ``"basic"`` (single mean/min/max/n for vitals + labs; 8 features)
+        or ``"rich"`` (per-category vitals + labs + GCS/RASS assessments + IMV/
+        NIPPV/CPAP/etc. respiratory flags; ~85 features). Rich is recommended
+        for actual modeling; basic is preserved for backwards compatibility
+        with prior runs and the original Phase 4 plan numbers.
 
     Raises
     ------
     ValueError
-        Empty cohort, all-zero / all-one labels, or both vitals AND labs
-        unusable (no features = no model).
+        Empty cohort, all-zero / all-one labels, no usable feature tables,
+        or an unrecognized ``feature_set``.
     """
+    if feature_set not in {"basic", "rich"}:
+        raise ValueError(
+            f"feature_set must be 'basic' or 'rich', got {feature_set!r}."
+        )
+
     config_snapshot: dict[str, Any] = {
         "cohort_spec": asdict(cohort_spec),
         "window_hours": window_hours,
         "test_size": test_size,
         "seed": seed,
         "include_hospice": include_hospice,
+        "feature_set": feature_set,
     }
 
     cohort, waterfall = build_cohort_with_waterfall(tables, cohort_spec)
@@ -222,9 +357,14 @@ def run_baseline_pipeline(
         how="inner",
     )
 
-    matrix, feature_names, warnings = _build_feature_matrix(
-        tables, cohort_with_labels, anchors, window_hours
-    )
+    if feature_set == "rich":
+        matrix, feature_names, warnings = _build_rich_feature_matrix(
+            tables, cohort_with_labels, anchors, window_hours
+        )
+    else:
+        matrix, feature_names, warnings = _build_feature_matrix(
+            tables, cohort_with_labels, anchors, window_hours
+        )
     if not feature_names:
         raise ValueError(
             "No usable feature tables (vitals and labs both missing or invalid); "
@@ -253,6 +393,11 @@ def run_baseline_pipeline(
     # patient counts per side after splitting. We strip it off X_train /
     # X_test before handing them to the model layer.
     pid_col = "__patient_id"
+    if pid_col in X.columns:
+        raise ValueError(
+            f"Reserved sentinel column {pid_col!r} collides with an existing feature; "
+            "rename the upstream feature or report this as a bug in run_baseline_pipeline."
+        )
     X_with_pid = X.with_columns(groups.alias(pid_col))
     X_with_pid_train, X_with_pid_test, y_train, y_test = group_train_test_split(
         X_with_pid, y, groups, test_size=test_size, seed=seed
