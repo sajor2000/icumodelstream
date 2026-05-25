@@ -96,11 +96,13 @@ def cohort(
 
 
 def _git_head_sha() -> str | None:
-    """Return the current git HEAD SHA, or None if unavailable.
+    """Return the git HEAD SHA of the icumodelstream package's repo, or None if unavailable.
 
-    Used purely as a reproducibility marker in baseline outputs; failure to
+    Resolves `cwd` to the package directory so the SHA always reflects icumodelstream's
+    state, not whatever directory the CLI happened to be invoked from. Failure to
     resolve a SHA must never break the CLI run.
     """
+    package_dir = Path(__file__).resolve().parent
     try:
         result = subprocess.run(
             ["git", "rev-parse", "HEAD"],
@@ -108,6 +110,7 @@ def _git_head_sha() -> str | None:
             text=True,
             check=False,
             timeout=5,
+            cwd=package_dir,
         )
     except (FileNotFoundError, subprocess.SubprocessError):
         return None
@@ -150,16 +153,22 @@ def _build_metrics_payload(
     code_version: str | None,
     generated_at: str,
 ) -> dict[str, Any]:
-    """Assemble the structured JSON payload written to ``--metrics-out``."""
+    """Assemble the structured JSON payload written to ``--metrics-out``.
+
+    Records only the basename of ``data_root`` (not the full absolute path) — paths
+    can leak usernames and site identifiers per CLAUDE.md data-safety rules.
+    """
     snap = result.config_snapshot
     config = {
-        "data_root": str(data_root),
+        "data_root_basename": data_root.name,
         "cohort_spec": snap["cohort_spec"],
         "window_hours": snap["window_hours"],
         "test_size": snap["test_size"],
         "seed": snap["seed"],
         "include_hospice": snap["include_hospice"],
         "feature_set": snap.get("feature_set", "basic"),
+        "outcome": snap.get("outcome", "mortality"),
+        "los_threshold_hours": snap.get("los_threshold_hours", 168.0),
     }
     return {
         "config": config,
@@ -239,7 +248,7 @@ def _build_markdown_summary(
     lines: list[str] = []
     lines.append(f"# Baseline metrics --- {payload['generated_at']}")
     lines.append("")
-    lines.append(f"**Data root:** `{config['data_root']}`")
+    lines.append(f"**Data root:** `{config['data_root_basename']}` (basename only)")
     lines.append(f"**Code version:** `{payload['code_version']}`")
     lines.append("")
     lines.append("## Configuration")
@@ -255,6 +264,10 @@ def _build_markdown_summary(
     lines.append(f"| seed | {config['seed']} |")
     lines.append(f"| include_hospice | {str(config['include_hospice']).lower()} |")
     lines.append(f"| feature_set | {config.get('feature_set', 'basic')} |")
+    outcome = config.get("outcome", "mortality")
+    lines.append(f"| outcome | {outcome} |")
+    if outcome == "los_gt_7d":
+        lines.append(f"| los_threshold_hours | {config.get('los_threshold_hours', 168.0)} |")
     lines.append("")
     lines.append("## Cohort waterfall")
     lines.append("")
@@ -365,8 +378,13 @@ def _print_baseline_terminal_summary(
     console.print(
         f"Split:     {result.n_train:,} train / {result.n_test:,} test (by patient_id)"
     )
+    outcome_label = {
+        "mortality": "Mortality",
+        "los_gt_7d": "LOS > 7d",
+    }.get(result.config_snapshot.get("outcome", "mortality"), "Outcome")
     console.print(
-        f"Mortality: {result.train_prevalence:.1%} train, {result.test_prevalence:.1%} test"
+        f"{outcome_label}: {result.train_prevalence:.1%} train, "
+        f"{result.test_prevalence:.1%} test"
     )
     console.print("")
     lgbm = result.lightgbm.metrics
@@ -420,6 +438,15 @@ def baseline(
         "'rich' = per-category vitals (HR, SBP, etc.) + per-category labs + GCS/RASS + "
         "respiratory device flags (~85 features).",
     ),
+    outcome: str = typer.Option(
+        "mortality",
+        help="Outcome label to predict. 'mortality' = in-hospital death "
+        "(default); 'los_gt_7d' = length of stay > threshold (default 168h = 7d).",
+    ),
+    los_threshold_hours: float = typer.Option(
+        168.0,
+        help="LOS threshold in hours when --outcome=los_gt_7d. Default 168 = 7 days.",
+    ),
 ) -> None:
     """Run the Phase 4 LightGBM + logistic baseline and write metrics + model artifacts."""
     resolved_root = _resolve_data_root(data_root)
@@ -434,6 +461,8 @@ def baseline(
         seed=seed,
         include_hospice=include_hospice,
         feature_set=feature_set,
+        outcome=outcome,
+        los_threshold_hours=los_threshold_hours,
     )
 
     generated_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")

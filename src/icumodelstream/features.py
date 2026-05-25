@@ -15,11 +15,19 @@ VALUE_CANDIDATES = (
 )
 NAME_CANDIDATES = ("name", "variable", "lab_name", "vital_name", "category")
 DATETIME_CANDIDATES = (
-    "recorded_dttm",     # vitals / patient_assessments
-    "lab_result_dttm",   # labs (use result time -- latest available, result is back)
+    "recorded_dttm",        # vitals / patient_assessments — point-of-care entry
+    # NB: For labs we prefer order/collect time over result time. result_dttm is
+    # when the result returned, which can be many hours after the sample was
+    # drawn — labs drawn inside an early prediction window but resulting late
+    # would be silently excluded if we keyed on result time. Tradeoff: in clinical
+    # production an early-warning model only knows results that have already come
+    # back; if you need that strict semantics, override by editing this tuple.
+    "lab_collect_dttm",     # labs — when sample was drawn (preferred)
+    "lab_order_dttm",       # labs — when order was placed (next-best)
+    "lab_result_dttm",      # labs — when result returned (fallback only)
     "obs_dttm",
     "measurement_dttm",
-    "admin_dttm",        # medication tables
+    "admin_dttm",           # medication tables
 )
 
 

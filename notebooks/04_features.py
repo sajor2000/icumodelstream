@@ -26,7 +26,8 @@ def _(mo):
     from pathlib import Path
     sys.path.insert(0, str(Path(__file__).parent))
     from _common import load_pipeline_config
-    config = load_pipeline_config(__file__, mo)
+    config, config_notice = load_pipeline_config(__file__, mo)
+    config_notice
     return (config,)
 
 

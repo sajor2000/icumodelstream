@@ -37,7 +37,8 @@ def _(mo):
     from pathlib import Path
     sys.path.insert(0, str(Path(__file__).parent))
     from _common import load_pipeline_config
-    config = load_pipeline_config(__file__, mo)
+    config, config_notice = load_pipeline_config(__file__, mo)
+    config_notice
     return (config,)
 
 
@@ -234,25 +235,24 @@ def _(cohort_with_labels, labs_features, mo, vitals_features):
 
 @app.cell
 def _(X, groups, mo, pl, y):
-    import numpy as np
-    from sklearn.model_selection import GroupShuffleSplit
-
     from icumodelstream.splits import group_train_test_split
 
-    # Recover positional indices so we can report unique-patient counts per side.
-    # GroupShuffleSplit with the same seed/test_size is deterministic, so these
-    # indices match the split that group_train_test_split produced.
-    groups_np = groups.to_numpy()
-    splitter = GroupShuffleSplit(n_splits=1, test_size=0.2, random_state=42)
-    tr_idx, te_idx = next(splitter.split(np.zeros(len(X)), groups=groups_np))
-
-    X_train, X_test, y_train, y_test = group_train_test_split(
-        X, y, groups, test_size=0.2, seed=42
+    # Use the same passenger-column pattern as pipeline.run_baseline_pipeline so
+    # any change to the splitter (e.g., stratified-group) flows here automatically
+    # without two parallel call sites drifting apart.
+    pid_col = "__patient_id"
+    if pid_col in X.columns:
+        raise ValueError(f"Reserved sentinel column {pid_col!r} collides with a feature.")
+    X_with_pid = X.with_columns(groups.alias(pid_col))
+    X_with_pid_train, X_with_pid_test, y_train, y_test = group_train_test_split(
+        X_with_pid, y, groups, test_size=0.2, seed=42
     )
+    n_train_patients = int(X_with_pid_train[pid_col].n_unique())
+    n_test_patients = int(X_with_pid_test[pid_col].n_unique())
+    X_train = X_with_pid_train.drop(pid_col)
+    X_test = X_with_pid_test.drop(pid_col)
     n_train = X_train.height
     n_test = X_test.height
-    n_train_patients = int(pl.Series(groups_np[tr_idx]).n_unique())
-    n_test_patients = int(pl.Series(groups_np[te_idx]).n_unique())
     train_prevalence = float(y_train.sum()) / n_train if n_train else 0.0
     test_prevalence = float(y_test.sum()) / n_test if n_test else 0.0
     split_df = pl.DataFrame({

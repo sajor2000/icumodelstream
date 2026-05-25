@@ -89,15 +89,86 @@ def extract_mortality_labels(
     )
 
     if result.height > 0 and int(result["mortality"].sum()) == 0:
-        observed = sorted({
-            v for v in lf.select(pl.col(discharge_col).cast(pl.Utf8)).collect().to_series().to_list()
-            if v is not None
-        })
+        observed_series = (
+            lf.select(pl.col(discharge_col).cast(pl.Utf8)).collect().to_series().to_list()
+        )
+        observed = sorted({v for v in observed_series if v is not None})
         raise ValueError(
             f"extract_mortality_labels: no rows match any known mortality vocabulary "
             f"in column {discharge_col!r}. Looked for any of {sorted(positive_values)}; "
             f"observed values: {observed[:20]}{' ...' if len(observed) > 20 else ''}. "
             f"Extend MORTALITY_VALUES if the source uses a different vocabulary."
         )
+
+    return result
+
+
+def extract_los_label(
+    tables: dict[str, TableRef], threshold_hours: float = 168.0
+) -> pl.DataFrame:
+    """Return one row per hospitalization with a "long length of stay" label.
+
+    LOS is computed as ``discharge_dttm - admission_dttm``. Hospitalizations
+    where LOS exceeds ``threshold_hours`` get label = 1, else 0. The default
+    threshold of 168 hours = 7 days is the conventional cutoff for "prolonged
+    ICU stay" in critical-care literature; adjust for shorter (e.g., 72h) or
+    longer (e.g., 14d) horizons via the parameter.
+
+    Rows with NULL ``admission_dttm`` OR NULL ``discharge_dttm`` are EXCLUDED
+    (LOS is undefined; still-admitted patients should not contribute a label
+    to a retrospective cohort).
+
+    Parameters
+    ----------
+    tables:
+        Discovered CLIF parquet tables (must include ``hospitalization``).
+    threshold_hours:
+        Length-of-stay cutoff in hours. Default 168.0 (= 7 days).
+
+    Returns
+    -------
+    DataFrame with two columns: ``hospitalization_id`` and ``long_los`` (Int8).
+
+    Raises
+    ------
+    ValueError
+        If ``admission_dttm`` or ``discharge_dttm`` is missing from the
+        hospitalization table (CLAUDE.md rule 7).
+    """
+    if threshold_hours <= 0:
+        raise ValueError(
+            f"threshold_hours must be positive, got {threshold_hours}."
+        )
+
+    lf = scan_table(tables, "hospitalization")
+    columns = set(lf.collect_schema().names())
+    missing = {"admission_dttm", "discharge_dttm"} - columns
+    if missing:
+        raise ValueError(
+            "hospitalization table is missing required datetime columns for LOS: "
+            f"{sorted(missing)}. Observed columns: {sorted(columns)}."
+        )
+
+    result = (
+        lf.filter(
+            pl.col("admission_dttm").is_not_null()
+            & pl.col("discharge_dttm").is_not_null()
+        )
+        .select(
+            pl.col("hospitalization_id"),
+            (
+                (
+                    pl.col("discharge_dttm").cast(pl.Datetime("us"))
+                    - pl.col("admission_dttm").cast(pl.Datetime("us"))
+                ).dt.total_seconds()
+                / 3600.0
+                > threshold_hours
+            )
+            .cast(pl.Int8)
+            .alias("long_los"),
+        )
+        .unique(subset=["hospitalization_id"])
+        .collect()
+    )
 
     return result

@@ -34,7 +34,7 @@ from icumodelstream.features import (
     respiratory_support_indicator,
 )
 from icumodelstream.io import TableRef, scan_table
-from icumodelstream.labels import extract_mortality_labels
+from icumodelstream.labels import extract_los_label, extract_mortality_labels
 from icumodelstream.models import (
     BaselineResult,
     fit_lightgbm_baseline,
@@ -122,27 +122,24 @@ def _try_windowed_features(
     cohort: pl.DataFrame,
     warnings: list[str],
 ) -> pl.DataFrame | None:
-    """Compute windowed features for a single table, or append a warning.
+    """Compute windowed features for a single table, or warn and return None.
 
-    Returns the feature DataFrame on success, ``None`` if the table is
-    absent or the aggregation raised ValueError (in either case the reason
-    is recorded in ``warnings`` so the caller surfaces it).
+    "Missing table" (a benign 'this site didn't export labs') is downgraded to a warning
+    so the pipeline can run with whichever tables ARE present. Any other ValueError
+    (parse failure, dtype mismatch, missing value column) is re-raised — per CLAUDE.md
+    rule 7 these are data-quality red flags the operator must see, not silent skips.
     """
     if table_name not in tables:
         warnings.append(f"{table_name} table not found in data root; skipping {prefix} features.")
         return None
-    try:
-        return aggregate_numeric_table_windowed(
-            tables,
-            table_name,
-            prefix,
-            anchors=anchors,
-            window_hours=window_hours,
-            cohort=cohort,
-        )
-    except ValueError as e:
-        warnings.append(f"{table_name} features skipped: {type(e).__name__}: {e}")
-        return None
+    return aggregate_numeric_table_windowed(
+        tables,
+        table_name,
+        prefix,
+        anchors=anchors,
+        window_hours=window_hours,
+        cohort=cohort,
+    )
 
 
 def _build_feature_matrix(
@@ -289,6 +286,8 @@ def run_baseline_pipeline(
     seed: int = 42,
     include_hospice: bool = False,
     feature_set: str = "basic",
+    outcome: str = "mortality",
+    los_threshold_hours: float = 168.0,
 ) -> BaselinePipelineResult:
     """Run the full Phase 4 baseline: cohort -> labels -> features -> models.
 
@@ -314,6 +313,14 @@ def run_baseline_pipeline(
         NIPPV/CPAP/etc. respiratory flags; ~85 features). Rich is recommended
         for actual modeling; basic is preserved for backwards compatibility
         with prior runs and the original Phase 4 plan numbers.
+    outcome:
+        Which label to predict: ``"mortality"`` (in-hospital death, default) or
+        ``"los_gt_7d"`` (prolonged length of stay, threshold parameterized via
+        ``los_threshold_hours``). Both are extracted from the hospitalization
+        table; LOS uses ``discharge_dttm - admission_dttm``.
+    los_threshold_hours:
+        Threshold in hours for the LOS outcome. Default 168.0 (= 7 days).
+        Ignored when ``outcome == "mortality"``.
 
     Raises
     ------
@@ -325,6 +332,10 @@ def run_baseline_pipeline(
         raise ValueError(
             f"feature_set must be 'basic' or 'rich', got {feature_set!r}."
         )
+    if outcome not in {"mortality", "los_gt_7d"}:
+        raise ValueError(
+            f"outcome must be 'mortality' or 'los_gt_7d', got {outcome!r}."
+        )
 
     config_snapshot: dict[str, Any] = {
         "cohort_spec": asdict(cohort_spec),
@@ -333,6 +344,8 @@ def run_baseline_pipeline(
         "seed": seed,
         "include_hospice": include_hospice,
         "feature_set": feature_set,
+        "outcome": outcome,
+        "los_threshold_hours": los_threshold_hours,
     }
 
     cohort, waterfall = build_cohort_with_waterfall(tables, cohort_spec)
@@ -344,7 +357,20 @@ def run_baseline_pipeline(
             f"after_icu={waterfall.after_icu_filter}."
         )
 
-    labels = extract_mortality_labels(tables, include_hospice=include_hospice)
+    if outcome == "mortality":
+        raw_labels = extract_mortality_labels(tables, include_hospice=include_hospice)
+        # Rename to a consistent internal column so downstream code never branches on outcome name.
+        labels = raw_labels.rename({"mortality": "outcome"})
+    else:  # outcome == "los_gt_7d"
+        raw_labels = extract_los_label(tables, threshold_hours=los_threshold_hours)
+        labels = raw_labels.rename({"long_los": "outcome"})
+    cohort_id_dtype = cohort.schema["hospitalization_id"]
+    label_id_dtype = labels.schema["hospitalization_id"]
+    if cohort_id_dtype != label_id_dtype:
+        raise ValueError(
+            f"hospitalization_id dtype mismatch between cohort ({cohort_id_dtype}) and "
+            f"labels ({label_id_dtype}); cast both sides to a common type before joining."
+        )
     cohort_with_labels = cohort.join(labels, on="hospitalization_id", how="inner")
     if cohort_with_labels.height == 0:
         raise ValueError(
@@ -373,13 +399,13 @@ def run_baseline_pipeline(
 
     # Inner join on hospitalization_id so X / y / groups are perfectly aligned.
     full = matrix.join(
-        cohort_with_labels.select("hospitalization_id", "patient_id", "mortality"),
+        cohort_with_labels.select("hospitalization_id", "patient_id", "outcome"),
         on="hospitalization_id",
         how="inner",
     ).sort("hospitalization_id")  # deterministic row order -> reproducible split
 
     X = full.select(feature_names)
-    y = full["mortality"]
+    y = full["outcome"]
     groups = full["patient_id"]
 
     y_sum = int(y.sum())

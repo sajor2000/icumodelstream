@@ -149,7 +149,9 @@ def _calibration_table(
     """
     edges = np.linspace(0.0, 1.0, _N_CALIBRATION_BINS + 1)
     # np.digitize returns 1..N for in-range values; clip to 0..N-1 for label semantics.
-    bin_idx = np.clip(np.digitize(y_pred_proba, edges[1:-1], right=False), 0, _N_CALIBRATION_BINS - 1)
+    bin_idx = np.clip(
+        np.digitize(y_pred_proba, edges[1:-1], right=False), 0, _N_CALIBRATION_BINS - 1
+    )
     df = pd.DataFrame({"bin": bin_idx, "y_true": y_true, "y_pred": y_pred_proba})
     grouped = (
         df.groupby("bin", sort=True)
@@ -175,9 +177,13 @@ def _compute_metrics(
     """
     intercept, slope = _calibration_intercept_slope(y_true, y_pred_proba)
     single_class = len(np.unique(y_true)) < 2
+    auroc = float("nan") if single_class else float(roc_auc_score(y_true, y_pred_proba))
+    auprc = (
+        float("nan") if single_class else float(average_precision_score(y_true, y_pred_proba))
+    )
     return {
-        "auroc": float("nan") if single_class else float(roc_auc_score(y_true, y_pred_proba)),
-        "auprc": float("nan") if single_class else float(average_precision_score(y_true, y_pred_proba)),
+        "auroc": auroc,
+        "auprc": auprc,
         "brier_score": float(brier_score_loss(y_true, y_pred_proba)),
         "prevalence": float(y_true.mean()),
         "calibration_intercept": intercept,

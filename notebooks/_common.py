@@ -20,22 +20,25 @@ if TYPE_CHECKING:
     import marimo as mo  # noqa: F401  -- only for typing in helper signatures
 
 
-def load_pipeline_config(notebook_file: str, mo: Any) -> AppConfig:
+def load_pipeline_config(notebook_file: str, mo: Any) -> tuple[AppConfig, Any]:
     """Load configs/local.yaml relative to the notebook, with example fallback.
 
-    On the example-fallback path, surfaces an info notice via mo.md (the caller
-    can choose to display it). On no-config-found, halts the cell via mo.stop.
-    Also asserts safety.allow_phi is False per CLAUDE.md data safety rules.
+    Returns ``(config, notice)``. ``notice`` is a marimo markdown element to display
+    when the example fallback fired, or ``None`` when local.yaml was used. The caller
+    should make ``notice`` (or a stack with it) the cell's last expression so the
+    fallback is surfaced visibly per CLAUDE.md rule 7.
+
+    Halts the cell via mo.stop on no-config-found, and on safety.allow_phi=True.
     """
     configs_dir = Path(notebook_file).parent.parent / "configs"
     config_path = configs_dir / "local.yaml"
     example_path = configs_dir / "local.example.yaml"
+    notice: Any = None
     if config_path.exists():
         config = load_config(config_path)
     elif example_path.exists():
         config = load_config(example_path)
-        # Notice cell may display this; we don't force it.
-        mo.md(
+        notice = mo.md(
             f"ℹ️ `configs/local.yaml` not found — using `{example_path.name}`. "
             "Copy it to `local.yaml` and edit `data.root` for your machine."
         )
@@ -48,7 +51,7 @@ def load_pipeline_config(notebook_file: str, mo: Any) -> AppConfig:
         config.safety.allow_phi,
         mo.md("**Safety check failed:** `allow_phi` must be False"),
     )
-    return config
+    return config, notice
 
 
 def discover_pipeline_tables(config: AppConfig, mo: Any) -> dict[str, TableRef]:
