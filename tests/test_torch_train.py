@@ -13,10 +13,11 @@ import pytest
 import torch
 
 from icumodelstream.sequences import SequenceTensors
-from icumodelstream.torch_models import LSTMBaseline
+from icumodelstream.torch_models import LSTMBaseline, SequenceResult
 from icumodelstream.torch_train import (
     SplitTensors,
     TrainingTrace,
+    fit_sequence_model,
     prepare_split_tensors,
     train_lstm,
 )
@@ -304,3 +305,139 @@ def test_train_lstm_reproducible_with_same_seed() -> None:
             f"parameter {name} differs across reproducible runs by "
             f"max_diff={max_diff:.2e}"
         )
+
+
+# ---------------------------------------------------------------------------
+# Sprint 3c: fit_sequence_model integration tests.
+#
+# These mirror the Sprint 3b separable-signal trick (channel 0 carries the
+# label) but wrap it as a real SequenceTensors so the full pipeline -- split,
+# train, predict, metrics, calibration -- is exercised end to end. Uses
+# device="cpu" and seed=42 so the run is reproducible inside CI / agent
+# harness on machines without GPUs.
+# ---------------------------------------------------------------------------
+
+
+def _make_separable_sequence_fixture(
+    n_hosps: int = 100, timesteps: int = 8, n_channels: int = 5, seed: int = 0
+) -> tuple[SequenceTensors, pl.DataFrame, pl.DataFrame]:
+    """Build a SequenceTensors where channel 0 carries label signal.
+
+    Each hospitalization belongs to its own patient (one-to-one) so the
+    70/15/15 patient-aware split degenerates to a 70/15/15 row-level split,
+    making it easy to verify shapes downstream without worrying about patient
+    bunching skewing the test fold size.
+    """
+    rng = np.random.default_rng(seed)
+    y = rng.integers(0, 2, size=n_hosps).astype(np.int64)
+    X = rng.standard_normal((n_hosps, timesteps, n_channels)).astype(np.float32) * 0.1
+    X[:, :, 0] += y[:, None].astype(np.float32) * 2.0
+    mask = np.ones((n_hosps, timesteps, n_channels - 2), dtype=np.int8)
+    hospitalization_ids = np.array([f"H{i}" for i in range(n_hosps)], dtype=object)
+    sequences = SequenceTensors(
+        X=X,
+        mask=mask,
+        hospitalization_ids=hospitalization_ids,
+        channel_names=[f"c{i}" for i in range(n_channels)],
+        numeric_channel_names=[f"c{i}" for i in range(n_channels - 2)],
+    )
+    labels = pl.DataFrame(
+        {
+            "hospitalization_id": hospitalization_ids.tolist(),
+            "outcome": y.tolist(),
+        }
+    )
+    # One patient per hospitalization: makes the patient-aware split land at
+    # the expected ~15% test fold, which lets us assert metric shapes without
+    # fighting patient-bunching flake.
+    groups = pl.DataFrame(
+        {
+            "hospitalization_id": hospitalization_ids.tolist(),
+            "patient_id": [f"P{i}" for i in range(n_hosps)],
+        }
+    )
+    return sequences, labels, groups
+
+
+def test_fit_sequence_model_end_to_end_separable() -> None:
+    """End-to-end LSTM run on a separable problem clears AUROC > 0.8."""
+    sequences, labels, groups = _make_separable_sequence_fixture(
+        n_hosps=100, timesteps=8, n_channels=5, seed=0
+    )
+
+    model, result = fit_sequence_model(
+        sequences,
+        labels,
+        groups,
+        hidden_dim=16,
+        n_layers=1,
+        max_epochs=5,
+        patience=10,  # > max_epochs so early stopping cannot fire
+        batch_size=32,
+        device="cpu",
+        seed=42,
+    )
+
+    assert isinstance(model, LSTMBaseline)
+    assert isinstance(result, SequenceResult)
+    assert result.model_name == "lstm"
+    # Shapes: y_pred_proba and y_true both 1-D, same length as the test fold.
+    assert result.y_pred_proba.ndim == 1
+    assert result.y_true.shape == result.y_pred_proba.shape
+    # Separable problem -> LSTM should easily clear 0.8 in 5 epochs.
+    assert result.metrics["auroc"] > 0.8, (
+        f"AUROC={result.metrics['auroc']:.3f} -- expected > 0.8 on the "
+        "separable fixture; check signal injection in channel 0."
+    )
+    # 10 fixed-decile bins, some may be empty on a ~15-row test fold; the
+    # calibration_table implementation drops empty bins via groupby, so we
+    # only assert the bound rather than a fixed row count.
+    assert 1 <= result.calibration_table.height <= 10
+    assert result.epochs_trained <= 5
+    # patience > max_epochs means we ran the full schedule without tripping.
+    assert result.epochs_trained == 5
+
+
+def test_fit_sequence_model_reproducible_with_same_seed() -> None:
+    """Same seed + CPU -> identical AUROC and identical y_pred_proba arrays."""
+    sequences, labels, groups = _make_separable_sequence_fixture(
+        n_hosps=100, timesteps=8, n_channels=5, seed=0
+    )
+
+    _model_a, result_a = fit_sequence_model(
+        sequences,
+        labels,
+        groups,
+        hidden_dim=16,
+        n_layers=1,
+        max_epochs=3,
+        patience=10,
+        batch_size=32,
+        device="cpu",
+        seed=42,
+    )
+    _model_b, result_b = fit_sequence_model(
+        sequences,
+        labels,
+        groups,
+        hidden_dim=16,
+        n_layers=1,
+        max_epochs=3,
+        patience=10,
+        batch_size=32,
+        device="cpu",
+        seed=42,
+    )
+
+    # CPU is bit-exact under our seeding scheme, so AUROC must match exactly.
+    assert result_a.metrics["auroc"] == result_b.metrics["auroc"], (
+        f"AUROC drifted across reproducible runs: "
+        f"{result_a.metrics['auroc']} vs {result_b.metrics['auroc']}"
+    )
+    # Element-wise equality on probabilities -- the strong reproducibility
+    # contract. allclose with atol=1e-5 covers any residual float jitter that
+    # might appear from move-to-device on different hardware while still
+    # catching real RNG-leak bugs.
+    assert np.allclose(
+        result_a.y_pred_proba, result_b.y_pred_proba, atol=1e-5
+    ), "y_pred_proba differs across reproducible runs"

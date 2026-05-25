@@ -138,7 +138,7 @@ def _calibration_intercept_slope(
     return float(lr.intercept_[0]), float(lr.coef_[0, 0])
 
 
-def _calibration_table(
+def calibration_table(
     y_true: np.ndarray, y_pred_proba: np.ndarray
 ) -> pl.DataFrame:
     """Bin predictions into fixed deciles (0.0, 0.1, ..., 1.0) and report mean pred vs actual.
@@ -166,7 +166,7 @@ def _calibration_table(
     )
 
 
-def _compute_metrics(
+def compute_metrics(
     y_true: np.ndarray, y_pred_proba: np.ndarray
 ) -> dict[str, float]:
     """Discrimination (AUROC, AUPRC), Brier, prevalence, and calibration.
@@ -240,8 +240,8 @@ def fit_lightgbm_baseline(
         model_name="lightgbm",
         y_true=y_test_np,
         y_pred_proba=y_pred_proba,
-        metrics=_compute_metrics(y_test_np, y_pred_proba),
-        calibration_table=_calibration_table(y_test_np, y_pred_proba),
+        metrics=compute_metrics(y_test_np, y_pred_proba),
+        calibration_table=calibration_table(y_test_np, y_pred_proba),
     )
     return model, result
 
@@ -279,8 +279,8 @@ def fit_logistic_baseline(
         model_name="logistic",
         y_true=y_test_np,
         y_pred_proba=y_pred_proba,
-        metrics=_compute_metrics(y_test_np, y_pred_proba),
-        calibration_table=_calibration_table(y_test_np, y_pred_proba),
+        metrics=compute_metrics(y_test_np, y_pred_proba),
+        calibration_table=calibration_table(y_test_np, y_pred_proba),
     )
     return pipeline, result
 

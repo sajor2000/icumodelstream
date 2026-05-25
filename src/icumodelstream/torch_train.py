@@ -21,8 +21,10 @@ from sklearn.metrics import roc_auc_score
 from torch import nn
 from torch.utils.data import DataLoader, TensorDataset
 
+from icumodelstream.models import calibration_table, compute_metrics
 from icumodelstream.sequences import SequenceTensors
 from icumodelstream.splits import group_train_test_split
+from icumodelstream.torch_models import LSTMBaseline, SequenceResult
 
 
 @dataclass(frozen=True)
@@ -486,3 +488,157 @@ def train_lstm(
         final_train_loss=float(final_train_loss),
         final_val_loss=float(final_val_loss),
     )
+
+
+# ---------------------------------------------------------------------------
+# Sprint 3c: public entry point that wires Sprints 3a + 3b together.
+#
+# CLAUDE.md rule 2 (simplicity first): no new training logic lives here -- this
+# function only sequences the existing pieces (prepare_split_tensors ->
+# LSTMBaseline -> train_lstm -> predict -> compute_metrics/calibration_table)
+# and packages the result. The next unit (U4) wraps this in a CLI command.
+# CLAUDE.md rule 8 (no silent patient leakage): test-set predictions and
+# metrics are computed AFTER the patient-aware split inside
+# prepare_split_tensors, so the test fold is unseen by both train and val.
+# ---------------------------------------------------------------------------
+
+
+def _autodetect_device() -> str:
+    """Return ``'cuda'`` if available, else ``'mps'`` if available, else ``'cpu'``.
+
+    Pure detection: no side effects, no environment-variable overrides. The
+    public ``fit_sequence_model`` calls this only when its ``device`` argument
+    is ``None``; passing an explicit string (e.g. ``"cpu"`` to force CPU on a
+    CUDA host) skips this entirely.
+    """
+    if torch.cuda.is_available():
+        return "cuda"
+    if torch.backends.mps.is_available():
+        return "mps"
+    return "cpu"
+
+
+def fit_sequence_model(
+    sequences: SequenceTensors,
+    labels: pl.DataFrame,
+    groups: pl.DataFrame,
+    *,
+    hidden_dim: int = 128,
+    n_layers: int = 2,
+    dropout: float = 0.3,
+    max_epochs: int = 20,
+    patience: int = 3,
+    learning_rate: float = 1e-3,
+    weight_decay: float = 1e-4,
+    batch_size: int = 256,
+    device: str | None = None,
+    seed: int = 42,
+) -> tuple[LSTMBaseline, SequenceResult]:
+    """End-to-end: SequenceTensors + labels -> trained LSTM + SequenceResult.
+
+    Wires the three Sprint-3 pieces together:
+
+    1. :func:`prepare_split_tensors` produces a patient-aware 70/15/15 split
+       (Sprint 3a). This is where the no-leakage guarantee lives.
+    2. :class:`icumodelstream.torch_models.LSTMBaseline` is constructed with
+       ``input_dim`` inferred from ``sequences.X.shape[2]``.
+    3. :func:`train_lstm` fits the model with BCE+pos_weight + AdamW + early
+       stopping (Sprint 3b) and mutates ``model`` so it carries the best-AUROC
+       weights on return.
+    4. The fitted model scores the test fold; sigmoid + numpy conversion give
+       probabilities.
+    5. :func:`icumodelstream.models.compute_metrics` and
+       :func:`icumodelstream.models.calibration_table` produce the same metric
+       dict and decile-binned calibration table as the flat baselines, so
+       downstream reporting code does not need to branch on model family.
+
+    Parameters
+    ----------
+    sequences:
+        Per-hospitalization tensors from
+        :func:`icumodelstream.sequences.build_sequence_tensors`.
+    labels:
+        DataFrame with ``hospitalization_id`` + an integer 0/1 outcome column
+        (``outcome``, ``mortality``, or ``long_los``).
+    groups:
+        DataFrame with ``hospitalization_id`` + ``patient_id`` used as the
+        grouping key for the patient-aware split.
+    hidden_dim, n_layers, dropout:
+        :class:`LSTMBaseline` architecture hyperparameters.
+    max_epochs, patience, learning_rate, weight_decay, batch_size:
+        :func:`train_lstm` hyperparameters.
+    device:
+        ``"cpu"``, ``"mps"``, ``"cuda"``, or ``None``. When ``None`` the
+        function picks the best available device via :func:`_autodetect_device`;
+        pass an explicit string to override (e.g. ``"cpu"`` for reproducible
+        CPU runs on a CUDA host).
+    seed:
+        Forwarded to both ``prepare_split_tensors`` and ``train_lstm`` so the
+        full pipeline is reproducible on CPU.
+
+    Returns
+    -------
+    tuple[LSTMBaseline, SequenceResult]
+        The fitted model (best-AUROC weights loaded) and a frozen result
+        dataclass with the same shape as :class:`icumodelstream.models.BaselineResult`
+        plus ``epochs_trained`` + ``early_stopped_at_epoch``.
+    """
+    tensors = prepare_split_tensors(sequences, labels, groups, seed=seed)
+    resolved_device = device if device is not None else _autodetect_device()
+
+    # Seed BEFORE constructing the model so LSTM weight init is deterministic.
+    # train_lstm re-seeds again internally for the optimizer + DataLoader,
+    # but by then the weights already exist; without this seed the model's
+    # initial parameters would carry forward whatever global RNG state the
+    # caller happened to leave behind, breaking end-to-end reproducibility.
+    torch.manual_seed(seed)
+    np.random.seed(seed)
+
+    input_dim = sequences.X.shape[2]
+    model = LSTMBaseline(
+        input_dim=input_dim,
+        hidden_dim=hidden_dim,
+        n_layers=n_layers,
+        dropout=dropout,
+    )
+
+    trace = train_lstm(
+        model,
+        tensors.X_train,
+        tensors.y_train,
+        tensors.X_val,
+        tensors.y_val,
+        max_epochs=max_epochs,
+        patience=patience,
+        learning_rate=learning_rate,
+        weight_decay=weight_decay,
+        batch_size=batch_size,
+        device=resolved_device,
+        seed=seed,
+    )
+
+    # Test-set inference. The model is on ``resolved_device`` after
+    # ``train_lstm``; move X_test there too and pull the resulting probabilities
+    # back to CPU/numpy for the metrics layer (sklearn doesn't accept torch
+    # tensors). model.eval() disables dropout so test scores are deterministic.
+    torch_device = torch.device(resolved_device)
+    model.eval()
+    with torch.no_grad():
+        X_test_dev = tensors.X_test.to(torch_device)
+        test_logits = model(X_test_dev)
+        y_pred_proba = torch.sigmoid(test_logits).detach().cpu().numpy()
+
+    y_true = tensors.y_test.detach().cpu().numpy().astype(int)
+    metrics = compute_metrics(y_true, y_pred_proba)
+    calib = calibration_table(y_true, y_pred_proba)
+
+    result = SequenceResult(
+        model_name="lstm",
+        y_true=y_true,
+        y_pred_proba=y_pred_proba,
+        metrics=metrics,
+        calibration_table=calib,
+        epochs_trained=trace.epochs_trained,
+        early_stopped_at_epoch=trace.early_stopped_at_epoch,
+    )
+    return model, result
